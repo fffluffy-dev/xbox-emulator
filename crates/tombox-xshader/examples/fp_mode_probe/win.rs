@@ -246,7 +246,7 @@ fn mode_helpers() -> String {
 /// the step where the mode is lost is visible.
 fn probe_round_mode(g: &mut Gpu) -> usize {
     let src = format!(
-        "RWByteAddressBuffer io : register(u0);\n{}[RootSignature(\"UAV(u0)\")]\n[numthreads(1, 1, 1)]\nvoid main() {{\n    uint4 x = io.Load4(0);\n    float a = asfloat(x.x), b = asfloat(x.y), c = asfloat(x.z); uint m = x.w;\n    precise float r = a + b; precise double e = tb_res2((double)a, (double)b, r); float q = tb_m_add(a, b, m);\n    uint el, eh; asuint(e, el, eh);\n    io.Store4(64, uint4(asuint(r), el, eh, asuint(q)));\n    precise double p = (double)c * (double)c; precise float r2 = (float)p; precise double e2 = p - (double)r2; float q2 = tb_m_mul(c, c, m);\n    uint fl, fh; asuint(e2, fl, fh);\n    io.Store4(80, uint4(asuint(r2), fl, fh, asuint(q2)));\n}}\n",
+        "RWByteAddressBuffer io : register(u0);\ndouble tb_f2d(float x) {{ uint b = asuint(x); uint e = (b >> 23) & 0xffu; if (e == 0u || e == 0xffu) return (double)x; return asdouble((b & 7u) << 29, (b & 0x80000000u) | ((e + 896u) << 20) | ((b & 0x7fffffu) >> 3)); }}\n{}[RootSignature(\"UAV(u0)\")]\n[numthreads(1, 1, 1)]\nvoid main() {{\n    uint4 x = io.Load4(0);\n    float a = asfloat(x.x), b = asfloat(x.y), c = asfloat(x.z); uint m = x.w;\n    precise float r = a + b; precise double e = tb_res2((double)a, (double)b, r); float q = tb_m_add(a, b, m);\n    uint el, eh; asuint(e, el, eh);\n    io.Store4(64, uint4(asuint(r), el, eh, asuint(q)));\n    precise double p = (double)c * (double)c; precise float r2 = (float)p; precise double e2 = p - (double)r2; float q2 = tb_m_mul(c, c, m);\n    uint fl, fh; asuint(e2, fl, fh);\n    io.Store4(80, uint4(asuint(r2), fl, fh, asuint(q2)));\n    precise double ea = fma((double)c, (double)c, -(double)r2);\n    double dc = tb_f2d(c);\n    precise double pb = dc * dc;\n    precise double eb = pb - (double)r2;\n    uint al, ah, bl, bh; asuint(ea, al, ah); asuint(eb, bl, bh);\n    io.Store4(96, uint4(al, ah, bl, bh));\n}}\n",
         mode_helpers()
     );
     let mut bad = 0;
@@ -272,6 +272,15 @@ fn probe_round_mode(g: &mut Gpu) -> usize {
             }
             if !show("tb_m_mul RTP", 20, 0x3d10_0000_0000_0000) {
                 bad += 1;
+            }
+            // Workarounds for the product error term: (a) fma in f64, (b) operands widened bitwise.
+            for (name, base) in [("product error via fma", 24usize), ("product error via bitwise f2d", 26)] {
+                let e = (o[base + 1] as u64) << 32 | o[base] as u64;
+                let ok = e == 0x3d10_0000_0000_0000;
+                println!("round-mode {name}: e={e:#018x} (want 0x3d10000000000000) {}", if ok { "ok" } else { "BAD" });
+                if !ok {
+                    bad += 1;
+                }
             }
         }
         Err(e) => {
