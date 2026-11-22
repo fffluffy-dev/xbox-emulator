@@ -1,0 +1,87 @@
+name: ci
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  linux-portable:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-portable
+      - name: Test host-independent crates
+        run: >
+          cargo test --no-fail-fast
+          -p tombox-xshader -p tombox-probe -p tombox-pe -p tombox-archive
+          -p tombox-rpf -p tombox-disasm
+
+  windows-xshader:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-xshader
+      - name: Environment
+        shell: pwsh
+        run: |
+          rustc -vV
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Directory | Select-Object Name
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\dxcompiler.dll" | Select-Object FullName
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion
+      - name: Test tombox-xshader (DXC + D3D12 exec tests)
+        run: cargo test -p tombox-xshader --no-fail-fast -- --test-threads=4
+
+  windows-workspace:
+    runs-on: windows-latest
+    timeout-minutes: 240
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-workspace
+      - name: Build workspace
+        id: build
+        shell: pwsh
+        run: |
+          cargo build --workspace --all-targets --keep-going --message-format=short 2>&1 | Tee-Object -FilePath build.log
+          exit $LASTEXITCODE
+      - name: Test workspace
+        if: always()
+        shell: pwsh
+        run: |
+          cargo test --workspace --no-fail-fast 2>&1 | Tee-Object -FilePath test.log
+          exit $LASTEXITCODE
+      - name: Summary
+        if: always()
+        shell: pwsh
+        run: |
+          "## Build errors" >> $env:GITHUB_STEP_SUMMARY
+          if (Test-Path build.log) { Select-String -Path build.log -Pattern '^error' | Select-Object -First 80 | ForEach-Object { "    $($_.Line)" } >> $env:GITHUB_STEP_SUMMARY }
+          "## Test results" >> $env:GITHUB_STEP_SUMMARY
+          if (Test-Path test.log) { Select-String -Path test.log -Pattern 'test result:|FAILED|panicked|Running ' | Select-Object -First 400 | ForEach-Object { "    $($_.Line)" } >> $env:GITHUB_STEP_SUMMARY }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-workspace-logs
+          path: |
+            build.log
+            test.log
+          if-no-files-found: ignore
