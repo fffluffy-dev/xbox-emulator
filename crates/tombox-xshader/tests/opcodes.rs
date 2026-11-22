@@ -590,7 +590,7 @@ fn lane_numbering_follows_guest_wave() {
         &["WaveReadLaneAt(v1, ((s2) & 31u))", "if (WaveGetLaneIndex() == ((s2) & 31u)) v5 = t", "(0x2u >> (t", "l >> 4)) & 1u) != 0u", "WaveActiveAnyTrue((exec_lo & 1u) != 0u)"],
     );
     let w64 = translate(&shader(&body(true), None)).expect("wave64 translates").hlsl;
-    assert!(!w64.contains("& ~31u") && !w64.contains("WaveActiveBallot"), "wave64 lowering changed:\n{w64}");
+    assert!(!w64.contains("& ~31u") && !w64.contains("WaveGetLaneIndex() >> 5;"), "wave64 lowering changed:\n{w64}");
 }
 
 #[test]

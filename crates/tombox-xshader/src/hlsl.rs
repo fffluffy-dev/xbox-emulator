@@ -4198,7 +4198,7 @@ impl<'a> Emitter<'a> {
             (format!("(({l} & ~7u) | (({:#x}u >> (({l} & 7u) * 3u)) & 7u))", ext >> 8), "true".to_string(), code == 234, true, "true".to_string(), 0)
         };
         self.line(&format!(
-            "uint {l} = WaveGetLaneIndex(); uint {rr} = {l} & 15u; uint {b} = {l} & ~15u; bool t{t}o = {inb}; uint t{t}s = t{t}o ? ({sl}) : {l}; uint t{t}v = WaveReadLaneAt({x}, t{t}s); bool t{t}a = WaveReadLaneAt(exec_lo & 1u, t{t}s) != 0u; bool t{t}k = t{t}o && ({} || t{t}a); bool t{t}w = {write} && (t{t}k || {});",
+            "uint {l} = WaveGetLaneIndex(); uint {rr} = {l} & 15u; uint {b} = {l} & ~15u; bool t{t}o = {inb}; uint t{t}s = t{t}o ? ({sl}) : {l}; uint t{t}v = WaveReadLaneAt({x}, t{t}s); uint4 t{t}m = WaveActiveBallot((exec_lo & 1u) != 0u); uint t{t}h = t{t}s >> 5u; uint t{t}mb = t{t}h == 0u ? t{t}m.x : t{t}h == 1u ? t{t}m.y : t{t}h == 2u ? t{t}m.z : t{t}m.w; bool t{t}a = ((t{t}mb >> (t{t}s & 31u)) & 1u) != 0u; bool t{t}k = t{t}o && ({} || t{t}a); bool t{t}w = {write} && (t{t}k || {});",
             fi, bc
         ));
         let is_float = m.contains("_f32") || m.contains("_f16");
@@ -4310,7 +4310,7 @@ impl<'a> Emitter<'a> {
             self.tmp += 1;
             let row = if m == "v_permlanex16_b32" { format!("((t{t}l & ~15u) ^ 16u)") } else { format!("(t{t}l & ~15u)") };
             self.line(&format!(
-                "uint t{t}l = WaveGetLaneIndex(); uint t{t}q = t{t}l & 15u; uint t{t}s = {row} | (((t{t}q < 8u) ? ({b} >> (t{t}q * 4u)) : ({c} >> ((t{t}q - 8u) * 4u))) & 15u); uint t{t}v = WaveReadLaneAt({a}, t{t}s); bool t{t}a = WaveReadLaneAt(exec_lo & 1u, t{t}s) != 0u;"
+                "uint t{t}l = WaveGetLaneIndex(); uint t{t}q = t{t}l & 15u; uint t{t}s = {row} | (((t{t}q < 8u) ? ({b} >> (t{t}q * 4u)) : ({c} >> ((t{t}q - 8u) * 4u))) & 15u); uint t{t}v = WaveReadLaneAt({a}, t{t}s); uint4 t{t}m = WaveActiveBallot((exec_lo & 1u) != 0u); uint t{t}h = t{t}s >> 5u; uint t{t}mb = t{t}h == 0u ? t{t}m.x : t{t}h == 1u ? t{t}m.y : t{t}h == 2u ? t{t}m.z : t{t}m.w; bool t{t}a = ((t{t}mb >> (t{t}s & 31u)) & 1u) != 0u;"
             ));
             let e = if fi { format!("t{t}v") } else { format!("(t{t}a ? t{t}v : {})", if bc { "0u".to_string() } else { old }) };
             return self.wv(&d, &e);
