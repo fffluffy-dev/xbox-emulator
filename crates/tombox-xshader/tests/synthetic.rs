@@ -426,19 +426,40 @@ fn memory_descriptors_load_through_the_global_windows() {
 /// samples an image: the T# came from memory too, and without the bindless lookup the
 /// translation must refuse instead of binding a guessed register.
 #[test]
-fn memory_descriptor_mode_refuses_images_with_a_clear_message() {
+fn memory_descriptor_images_come_from_the_descriptor_heap() {
     let mut words = mem_desc_program();
     words.pop();
     words.extend([
         0xf40c_0508, // s_load_dwordx8 s[20:27], s[16:17], 0x40
         0xfa00_0040,
+        0xf408_0708, // s_load_dwordx4 s[28:31], s[16:17], 0x60
+        0xfa00_0060,
         0xf000_0f08, // image_load v[4:7], v0, s[20:27] (2D, dmask 0xf)
+        0x0005_0400,
+        0xf09c_0108, // image_sample_lz v8, v[2:3], s[20:27], s[28:31] (2D, dmask 1)
+        0x00e5_0802,
+        0xf020_1108, // image_store v[4:7], v0, s[20:27] (2D, dmask 1)
         0x0005_0400,
         S_ENDPGM,
     ]);
     let mut ex = shader(Stage::Compute, &words, vec![], vec![], None);
     ex.isa_preamble = [0, 64, 1, 1];
     (ex.has_input_sig, ex.has_output_sig) = (false, false);
-    let e = translate(&ex).err().expect("an image from a memory descriptor is not supported yet");
-    assert!(e.contains("memory-descriptor fallback after") && e.contains("bindless"), "{e}");
+    let t = translate(&ex).unwrap_or_else(|e| panic!("{e}"));
+    assert!(t.mem_user_data && t.mem_desc_table && t.needs_global, "{}", t.hlsl);
+    assert_eq!(t.profile, "cs_6_6");
+    for want in [
+        "ByteAddressBuffer tb_dtab : register(t0, space4000003);",
+        "uint tb_didx(uint kind, uint4 d)",
+        "tb_gfault.InterlockedAdd(12, 1u, p);",
+        "= ResourceDescriptorHeap[NonUniformResourceIndex(tb_didx(0u, uint4(s20, s21, s22, s23)))];",
+        "= ResourceDescriptorHeap[NonUniformResourceIndex(tb_didx(1u, uint4(s20, s21, s22, s23)))];",
+        "SamplerState samp",
+        "= SamplerDescriptorHeap[NonUniformResourceIndex(tb_didx(2u, uint4(s28, s29, s30, s31)))];",
+        "RWTexture2D<",
+    ] {
+        assert!(t.hlsl.contains(want), "missing {want}\n{}", t.hlsl);
+    }
+    // No static register binding for the heap objects.
+    assert!(!t.hlsl.contains(": register(t1") && !t.hlsl.contains(": register(s0)"), "{}", t.hlsl);
 }

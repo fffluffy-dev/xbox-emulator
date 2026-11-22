@@ -48,6 +48,10 @@ pub struct Translated {
     /// Memory-descriptor mode (see hlsl/memdesc.rs): the runtime binds cbuffer TbUser (initial
     /// s0..s31) and the global windows.
     pub mem_user_data: bool,
+    /// Images or samplers read from memory: the runtime also binds the T# / S# lookup table
+    /// (t0 in the global space, `global_abi::desc_table`) and sets the root-signature flags
+    /// CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED and SAMPLER_HEAP_DIRECTLY_INDEXED.
+    pub mem_desc_table: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -411,6 +415,8 @@ struct Emitter<'a> {
     out_params: Vec<u32>,
     user_base_override: Option<usize>,
     mem_desc: bool,
+    /// Memory-descriptor mode looked up an image or sampler (needs the lookup table).
+    uses_dtab: bool,
     durango: Option<Vec<(u32, u32)>>,
     rm_mode: std::cell::Cell<Option<bool>>,
     rm_loads: BTreeMap<usize, u32>,
@@ -446,6 +452,9 @@ struct Emitter<'a> {
 const OP_WAVE_REDUCE: u32 = 0x7ff0;
 
 const BINDLESS: u32 = 0x8000_0000;
+/// Image / sampler "slot" of an instruction whose T# / S# came from memory (memdesc.rs): the
+/// low bits are the instruction index, the object is a local handle from the descriptor heap.
+const MEMIMG: u32 = 0x4000_0000;
 
 const OP_WAVE_SCAN: u32 = 0x7ff1;
 
@@ -1047,6 +1056,7 @@ fn translate_with(ex: &ShaderExtract, user_base_override: Option<usize>, uav_for
         uses_bvh: false,
         uses_global: false,
         mem_desc,
+        uses_dtab: false,
         mode_use: mode::ModeUse::default(),
     };
     em.vreg_array = em.insns.iter().any(|i| i.mnemonic.starts_with("v_movrel"));
@@ -1097,6 +1107,10 @@ fn translate_with(ex: &ShaderExtract, user_base_override: Option<usize>, uav_for
     };
     let profile = match (em.sm6_minor, profile.split('_').next()) {
         (0, _) => profile,
+        (6, Some("ps")) => "ps_6_6",
+        (6, Some("vs")) => "vs_6_6",
+        (6, Some("cs")) => "cs_6_6",
+        (6, Some("gs")) => "gs_6_6",
         (7, Some("ps")) => "ps_6_7",
         (7, Some("vs")) => "vs_6_7",
         (7, Some("cs")) => "cs_6_7",
@@ -1111,7 +1125,7 @@ fn translate_with(ex: &ShaderExtract, user_base_override: Option<usize>, uav_for
         (_, Some("ms")) => "ms_6_8",
         _ => profile,
     };
-    Ok(Translated { hlsl, entry: "main", profile, mip_uavs: em.uav_mips.iter().copied().collect(), mip_srvs: em.tex_mips.iter().copied().collect(), needs_gmem: em.uses_bvh, needs_global: em.uses_global, mem_user_data: em.mem_desc })
+    Ok(Translated { hlsl, entry: "main", profile, mip_uavs: em.uav_mips.iter().copied().collect(), mip_srvs: em.tex_mips.iter().copied().collect(), needs_gmem: em.uses_bvh, needs_global: em.uses_global, mem_user_data: em.mem_desc, mem_desc_table: em.uses_dtab })
 }
 
 impl<'a> Emitter<'a> {
@@ -1229,6 +1243,10 @@ impl<'a> Emitter<'a> {
     }
 
     fn decl(&self, used: &mut Vec<(String, u8, usize)>, ty: &str, name: &str, slot: u32, class: char, range_type: u32, stride: u32) -> Result<String, String> {
+        if slot & MEMIMG != 0 && slot & BINDLESS == 0 {
+            // A local handle from the descriptor heap (memdesc.rs), declared where it is used.
+            return Ok(String::new());
+        }
         if slot & BINDLESS == 0 {
             return Ok(format!("{ty} {name} : register({});\n", Self::reg_of(class, slot)));
         }
@@ -2116,9 +2134,10 @@ impl<'a> Emitter<'a> {
                     }
                 }
                 Enc::Mimg if self.mem_desc && !ins.mnemonic.starts_with("image_bvh") => {
-                    // No root signature: the T# / S# came from memory, and binding it needs the
-                    // run-time bindless lookup (not implemented). Refuse rather than bind a guess.
-                    return Err(format!("{} at {:#x}: image descriptor from memory needs the bindless T# lookup (memory-descriptor mode, not implemented yet)", ins.mnemonic, ins.offset));
+                    // No root signature: the T# / S# came from memory and is looked up at run
+                    // time (memdesc.rs).
+                    let v = self.mem_img_res(idx, ins)?;
+                    self.res.insert(idx, v);
                 }
                 Enc::Mimg if ins.mnemonic.starts_with("image_bvh") => {
                     for d in &ins.dst {
@@ -5472,6 +5491,9 @@ impl<'a> Emitter<'a> {
             return self.emit_bvh(ins);
         }
         let rs = self.res.get(&idx).cloned().ok_or("unresolved image")?;
+        if self.mem_desc {
+            self.emit_mem_img_bind(ins, &rs)?;
+        }
         if ins.mnemonic == "image_get_resinfo" {
             let (slot, dim, is_uav) = match rs.first() {
                 Some(Res::Tex(t, d)) => (*t, *d, false),
@@ -5547,7 +5569,7 @@ impl<'a> Emitter<'a> {
             let as_uint = is_uav && self.uav_uint.contains(&slot);
             let uobj = if is_uav && with_mip {
                 let o = if nsa > 0 { ins.src[ncoord] } else { Opnd::Vgpr(first + ncoord as u8) };
-                if slot & BINDLESS != 0 {
+                if slot & (BINDLESS | MEMIMG) != 0 {
                     return Err(format!("{} on a bindless UAV: per-mip views need a heap-mirrored descriptor range", ins.mnemonic));
                 }
                 self.touch(&o);
@@ -5866,7 +5888,7 @@ impl<'a> Emitter<'a> {
                 if self.ex.stage != Stage::Pixel {
                     return Err(format!("{} (implicit LOD) outside a pixel shader", ins.mnemonic));
                 }
-                if tslot & BINDLESS != 0 {
+                if tslot & (BINDLESS | MEMIMG) != 0 {
                     return Err(format!("{} on a bindless texture: per-mip views need a heap-mirrored descriptor range", ins.mnemonic));
                 }
                 self.tex_mips.insert(tslot);
@@ -6171,6 +6193,44 @@ impl<'a> Emitter<'a> {
         out
     }
 
+    /// HLSL type of texture SRV `slot` (image dim code from the MIMG instruction).
+    fn srv_ty(&self, slot: u32, dim: u32) -> Result<String, String> {
+        let ty = match dim {
+            0 => "Texture1D",
+            4 => "Texture1DArray",
+            1 => "Texture2D",
+            2 => "Texture3D",
+            3 => "TextureCube",
+            5 => "Texture2DArray",
+            6 => "Texture2DMS",
+            _ => return Err(format!("texture dim {dim} unsupported")),
+        };
+        let e = match self.img_ty.get(&(false, slot)) {
+            Some(2) => "int4",
+            Some(_) => "uint4",
+            None => "float4",
+        };
+        Ok(format!("{ty}<{e}>"))
+    }
+
+    /// HLSL type of image UAV `slot`. Textures used with image atomics hold one uint per texel.
+    fn uav_ty(&self, slot: u32, dim: u32) -> Result<String, String> {
+        let e = match self.img_ty.get(&(true, slot)) {
+            Some(2) => "int4",
+            Some(_) => "uint4",
+            None => "float4",
+        };
+        Ok(match (dim, self.uav_uint.contains(&slot)) {
+            (1, false) => format!("RWTexture2D<{e}>"),
+            (2, false) => format!("RWTexture3D<{e}>"),
+            (5, false) => format!("RWTexture2DArray<{e}>"),
+            (1, true) => "RWTexture2D<uint>".to_string(),
+            (2, true) => "RWTexture3D<uint>".to_string(),
+            (5, true) => "RWTexture2DArray<uint>".to_string(),
+            _ => return Err(format!("UAV dim {dim} unsupported")),
+        })
+    }
+
     fn finish(&mut self, is_ps: bool) -> Result<String, String> {
         let dg_init = self.dg_sgpr_init();
         let ex = self.ex;
@@ -6185,6 +6245,9 @@ impl<'a> Emitter<'a> {
         }
         if self.uses_global {
             h.push_str(&global::helpers());
+        }
+        if self.uses_dtab {
+            h.push_str(&memdesc::dtab_helpers());
         }
         if self.uses_bvh {
             h.push_str(&BVH_HELPERS.replace("TB_GMEM_SPACE", &TB_GMEM_SPACE.to_string()));
@@ -6217,24 +6280,10 @@ impl<'a> Emitter<'a> {
             }
         }
         for (slot, dim) in &self.tex {
-            let ty = match dim {
-                0 => "Texture1D",
-                4 => "Texture1DArray",
-                1 => "Texture2D",
-                2 => "Texture3D",
-                3 => "TextureCube",
-                5 => "Texture2DArray",
-                6 => "Texture2DMS",
-                _ => return Err(format!("texture dim {dim} unsupported")),
-            };
-            let e = match self.img_ty.get(&(false, *slot)) {
-                Some(2) => "int4",
-                Some(_) => "uint4",
-                None => "float4",
-            };
-            h.push_str(&self.decl(&mut used, &format!("{ty}<{e}>"), &format!("tex{slot}"), *slot, 't', 0, 32)?);
+            let ty = self.srv_ty(*slot, *dim)?;
+            h.push_str(&self.decl(&mut used, &ty, &format!("tex{slot}"), *slot, 't', 0, 32)?);
             if self.tex_mips.contains(slot) {
-                let _ = writeln!(h, "{ty}<{e}> tex{slot}_m[16] : register(t{}, space{});", (slot & 0xffff) * 16, TB_MIP_SPACE + (slot >> 16));
+                let _ = writeln!(h, "{ty} tex{slot}_m[16] : register(t{}, space{});", (slot & 0xffff) * 16, TB_MIP_SPACE + (slot >> 16));
             }
         }
         for slot in &self.samp {
@@ -6274,21 +6323,7 @@ impl<'a> Emitter<'a> {
             };
         }
         for (slot, dim) in &self.uav {
-            // Textures used with image atomics hold one uint per texel.
-            let e = match self.img_ty.get(&(true, *slot)) {
-                Some(2) => "int4",
-                Some(_) => "uint4",
-                None => "float4",
-            };
-            let ty = match (dim, self.uav_uint.contains(slot)) {
-                (1, false) => format!("RWTexture2D<{e}>"),
-                (2, false) => format!("RWTexture3D<{e}>"),
-                (5, false) => format!("RWTexture2DArray<{e}>"),
-                (1, true) => "RWTexture2D<uint>".to_string(),
-                (2, true) => "RWTexture3D<uint>".to_string(),
-                (5, true) => "RWTexture2DArray<uint>".to_string(),
-                _ => return Err(format!("UAV dim {dim} unsupported")),
-            };
+            let ty = self.uav_ty(*slot, *dim)?;
             h.push_str(&self.decl(&mut used, &ty, &format!("uav{slot}"), *slot, 'u', 1, 32)?);
             if self.uav_mips.contains(slot) {
                 let _ = writeln!(h, "{ty} uav{slot}_m[16] : register(u{}, space{});", (slot & 0xffff) * 16, TB_MIP_SPACE + (slot >> 16));
