@@ -156,11 +156,6 @@ pub fn dynamic_names(bytes: &[u8], wanted: &BTreeSet<String>) -> Vec<String> {
     dll_strings(bytes).intersection(wanted).cloned().collect()
 }
 
-pub fn companion_names(bytes: &[u8], staged: &str) -> Vec<String> {
-    let stem = staged.strip_suffix(".dll").unwrap_or(staged);
-    let want: BTreeSet<String> = [format!("{stem}_sys.dll")].into_iter().collect();
-    dynamic_names(bytes, &want)
-}
 
 #[cfg(test)]
 mod tests {
@@ -235,6 +230,7 @@ mod tests {
         b.extend("Xmem.dll".encode_utf16().flat_map(|c| c.to_le_bytes()));
         let got = dynamic_names(&b, &set(&["audiohalwrapper.dll", "xmem.dll", "xg_x.dll"]));
         assert_eq!(got, vec!["audiohalwrapper.dll".to_string(), "xmem.dll".to_string()]);
-        assert_eq!(companion_names(b"..mfplat_sys.dll..", "mfplat.dll"), vec!["mfplat_sys.dll".to_string()]);
+        assert!(dll_strings(b"..mfplat_sys.dll.. advapi32_sys.RegOpenKeyW advapi32_sys.dll").contains("mfplat_sys.dll"));
+        assert!(dll_strings(b"forward advapi32_sys.dll").contains("advapi32_sys.dll"));
     }
 }

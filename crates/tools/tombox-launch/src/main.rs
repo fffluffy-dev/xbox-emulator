@@ -17,6 +17,8 @@ const USAGE: &str = "tombox-launch <dump or Mount dir> --runtime <dir with the r
                        by default the runtime's copy wins, e.g. its WinHTTP-based XCurl.dll)
   --prefer-runtime N   stage the runtime's N even where it would not be (repeatable)
   --env K=V            extra environment for the title (repeatable)
+  --dxc DIR            directory with Microsoft's dxcompiler.dll + dxil.dll for dxcompiler_x
+                       (sets TOMBOX_DXC_DIR; default: $TOMBOX_DXC_DIR)
   --prefix DIR         Wine prefix (default: $WINEPREFIX); its system32 is the host DLL set
   --wine CMD           Wine / Proton wine64 used to start the title off Windows (default: $WINE or wine)
   --mdbg PATH          start the title under mdbg.exe (OutputDebugString and exception trace)
@@ -38,6 +40,7 @@ struct Args {
     prefer_title: BTreeSet<String>,
     env: Vec<(String, String)>,
     prefix: Option<PathBuf>,
+    dxc: Option<PathBuf>,
     into_prefix: BTreeSet<String>,
     wine: Option<String>,
     mdbg: Option<PathBuf>,
@@ -74,6 +77,7 @@ fn parse_args(v: &[String]) -> Result<Args, String> {
                 a.env.push((k.to_string(), val.to_string()));
             }
             "--prefix" => a.prefix = Some(PathBuf::from(next(&mut i)?)),
+            "--dxc" => a.dxc = Some(PathBuf::from(next(&mut i)?)),
             "--into-prefix" => {
                 a.into_prefix.insert(lower(&next(&mut i)?));
             }
@@ -335,18 +339,31 @@ fn run(a: Args) -> Result<(), String> {
     }
     let plan = plan::build(&inp);
     let mut companions: Vec<(String, String)> = Vec::new();
-    for s in &plan.stage {
-        if let Ok(bytes) = std::fs::read(runtime.join(find_ci(&runtime, s).and_then(|p| p.file_name().map(|f| f.to_owned())).unwrap_or_default())) {
-            for c in plan::companion_names(&bytes, s) {
-                companions.push((s.trim_end_matches(".dll").to_string() + ".dll", c));
+    for e in std::fs::read_dir(&runtime).map(|rd| rd.flatten().collect::<Vec<_>>()).unwrap_or_default() {
+        let n = lower(&e.file_name().to_string_lossy());
+        if !n.ends_with(".dll") || n.ends_with("_sys.dll") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(e.path()) else { continue };
+        for c in plan::dll_strings(&bytes).into_iter().filter(|c| c.ends_with("_sys.dll")) {
+            let src = format!("{}.dll", c.trim_end_matches("_sys.dll"));
+            if !companions.iter().any(|(_, have)| *have == c) && !inp.runtime.contains(&c) {
+                companions.push((src, c));
             }
         }
     }
-    if !cfg!(windows) && inp.host.is_some() && plan.stage.contains("xgameruntime.dll") && !a.into_prefix.contains("xgameruntime.dll") {
-        notes.push("xgameruntime.dll is staged beside the executable; if the title loads it from System32 only, add --into-prefix xgameruntime.dll".into());
+    companions.sort();
+    let dxc = a.dxc.clone().or_else(|| std::env::var_os("TOMBOX_DXC_DIR").map(PathBuf::from));
+    match &dxc {
+        Some(d) if find_ci(d, "dxcompiler.dll").is_none() && !cfg!(windows) => notes.push(format!("{}: no dxcompiler.dll there; dxcompiler_x will answer E_NOTIMPL", d.display())),
+        Some(_) => {}
+        None if plan.stage.contains("dxcompiler_x.dll") && find_ci(&runtime, "dxcompiler.dll").is_none() => {
+            notes.push("dxcompiler_x is staged but no DXC was given: pass --dxc <dir with dxcompiler.dll and dxil.dll>, or the title's shader compiler calls fail".into())
+        }
+        None => {}
     }
     for (src, c) in &companions {
-        notes.push(format!("{c}: copy of the host's {src} (the runtime's {src} forwards to it)"));
+        notes.push(format!("{c}: copy of the host's {src} (runtime DLLs forward to it)"));
     }
     let rep = report(&cfg, &exe, &plan, &notes);
     print!("{rep}");
@@ -371,7 +388,7 @@ fn run(a: Args) -> Result<(), String> {
             Some(p) => {
                 std::fs::copy(&p, overlay.join(c)).map_err(|e| format!("companion {c}: {e}"))?;
             }
-            None => eprintln!("warning: no host {src} to stage as {c}"),
+            None => println!("note: no host {src} to stage as {c}"),
         }
     }
     for n in &a.into_prefix {
@@ -404,6 +421,9 @@ fn run(a: Args) -> Result<(), String> {
         ("TOMBOX_COMPAT_DIR".into(), win_path(&runtime)),
         ("TOMBOX_LOG".into(), win_path(&logs.join("tombox_compat.log"))),
     ];
+    if let Some(d) = &dxc {
+        env.push(("TOMBOX_DXC_DIR".into(), win_path(d)));
+    }
     if !cfg!(windows) {
         env.push(("WINEPATH".into(), win_path(&runtime)));
         let mut ov: Vec<String> = plan.stage.iter().map(|s| format!("{}=n,b", s.trim_end_matches(".dll"))).collect();

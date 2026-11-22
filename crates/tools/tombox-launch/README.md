@@ -19,7 +19,8 @@ What it does:
 4. Builds an overlay in `<work>/Mount`.
    - The package is mirrored with symlinks (Unix) or hard links (Windows), so the dump is never modified.
    - The **runtime** DLLs are copied beside the executable.
-   - A runtime DLL that forwards to `<name>_sys.dll` (such as `mfplat`) gets a copy of the host's `<name>.dll` under that name.
+   - Any runtime DLL may forward to `<name>_sys.dll` (`advapi32legacy` to `advapi32_sys`, `mfplat` to `mfplat_sys`, ...). For each such name, a copy of the host's `<name>.dll` goes into the overlay under that name.
+   - `--dxc DIR`, or `$TOMBOX_DXC_DIR`, points `dxcompiler_x` at Microsoft's `dxcompiler.dll` + `dxil.dll`. Without them the title's shader compiler calls fail.
 5. Writes `<work>/launch_report.md` and `<work>/launch.env`.
    - The runtime environment: `TOMBOX_PACKAGE_ROOT`, `TOMBOX_XBTHUNK_TITLE_ROOT`, `TOMBOX_GDK_ROOT`, `TOMBOX_XCRD_ROOT`, `TOMBOX_COMPAT_DIR`, `TOMBOX_LOG`.
    - Off Windows also `WINEPATH`, so the runtime's own dependencies resolve after the host's system DLLs, and `WINEDLLOVERRIDES=<staged>=n,b`. These are appended to any existing overrides, so vkd3d-proton settings survive.
