@@ -288,3 +288,73 @@ pub fn parse_rts0(body: &[u8]) -> Result<RootSig, String> {
     }
     Ok(RootSig { version, flags, params, num_static_samplers, static_samplers })
 }
+
+/// One entry of the vertex-shader input table in the FSSM header: the fetch subroutine the
+/// runtime builds from the input layout fills `count` VGPRs from `first_vgpr` with components
+/// 0..count of input register `register` (ISG1). `read_mask` is the components the code reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FssmVertexInput {
+    pub register: u32,
+    pub read_mask: u8,
+    pub first_vgpr: u32,
+    pub count: u32,
+}
+
+/// Vertex input table of an FSSM blob: 5-byte entries from offset 0x138 while byte 0 is 6
+/// (byte 1 input register, byte 2 read mask, byte 3 first VGPR, byte 4 highest component read).
+/// Layout as documented by the americas-recomp project (docs/xbox/XBOX_SHADERS.md, "Vertex fetch
+/// subroutine"), checked there on 2,236 Xbox Series vertex shaders: first VGPRs 4, 8, 12, ... for
+/// shaders opening with `s_swappc_b64 s[4:5]` and 9, 13, ... for the VS merged in front of a GS.
+/// Empty when the blob has no such table (shaders without vertex inputs).
+pub fn fssm_vertex_inputs(fssm: &[u8]) -> Vec<FssmVertexInput> {
+    let mut out = Vec::new();
+    if fssm.get(0..4) != Some(b"FSSM") {
+        return out;
+    }
+    let end = fssm.len().min(0x1d0);
+    let mut p = 0x138;
+    while p + 5 <= end && fssm[p] == 6 {
+        let e = &fssm[p..p + 5];
+        if e[4] > 3 {
+            return Vec::new();
+        }
+        out.push(FssmVertexInput { register: e[1] as u32, read_mask: e[2], first_vgpr: e[3] as u32, count: e[4] as u32 + 1 });
+        p += 5;
+    }
+    out
+}
+
+#[cfg(test)]
+mod fssm_vin_tests {
+    use super::*;
+
+    fn blob(entries: &[[u8; 5]]) -> Vec<u8> {
+        let mut b = vec![0u8; 0x200];
+        b[0..4].copy_from_slice(b"FSSM");
+        for (k, e) in entries.iter().enumerate() {
+            b[0x138 + 5 * k..0x138 + 5 * k + 5].copy_from_slice(e);
+        }
+        b
+    }
+
+    #[test]
+    fn reads_entries_until_the_tag_stops() {
+        let b = blob(&[[6, 0, 0x7, 9, 2], [6, 2, 0x3, 13, 1]]);
+        assert_eq!(
+            fssm_vertex_inputs(&b),
+            vec![
+                FssmVertexInput { register: 0, read_mask: 7, first_vgpr: 9, count: 3 },
+                FssmVertexInput { register: 2, read_mask: 3, first_vgpr: 13, count: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn no_table_without_fssm_magic_or_tag() {
+        assert!(fssm_vertex_inputs(&blob(&[])).is_empty());
+        let mut b = blob(&[[6, 0, 0xf, 4, 3]]);
+        b[0..4].copy_from_slice(b"XXXX");
+        assert!(fssm_vertex_inputs(&b).is_empty());
+        assert!(fssm_vertex_inputs(&blob(&[[6, 0, 0xf, 4, 7]])).is_empty(), "component index past w is not a table");
+    }
+}

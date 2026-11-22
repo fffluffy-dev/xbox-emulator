@@ -325,3 +325,31 @@ fn pixel_attribute_past_the_interpolants_reads_the_layer_sysval() {
     let t = translate(&ex).expect("v_interp_mov of the layer attribute translates");
     assert!(t.hlsl.contains("(uint)(i.i1.x)"), "{}", t.hlsl);
 }
+
+/// Vertex inputs follow the FSSM header's input table (first VGPR per input) when it is there:
+/// a VS merged in front of a GS gets its first attribute in v9, not in v4 as the plain-VS
+/// fallback grouping assumes.
+#[test]
+fn vertex_inputs_follow_the_fssm_input_table() {
+    let words = [
+        0xf800_08cf, // exp pos0 v9, v10, v11, v12 (done)
+        0x0c0b_0a09,
+        S_ENDPGM,
+    ];
+    let mut attr = sig("ATTRIBUTE", 0, 3, 0, 0xf);
+    attr.rw_mask = 0xf;
+    let mut ex = shader(Stage::Vertex, &words, vec![attr], vec![sig("SV_Position", 1, 3, 0, 0xf)], None);
+    let mut fssm = vec![0u8; 0x200];
+    fssm[0..4].copy_from_slice(b"FSSM");
+    fssm[0x138..0x13d].copy_from_slice(&[6, 0, 0xf, 9, 3]);
+    ex.fssm = fssm;
+    let t = translate(&ex).expect("translate");
+    for (v, c) in [(9, 'x'), (10, 'y'), (11, 'z'), (12, 'w')] {
+        assert!(t.hlsl.contains(&format!("v{v} = asuint(i.i0.{c});")), "v{v}:\n{}", t.hlsl);
+    }
+    assert!(!t.hlsl.contains("v4 = asuint(i.i0.x);"), "{}", t.hlsl);
+    // Without the table the plain-VS grouping still applies.
+    ex.fssm = Vec::new();
+    let t = translate(&ex).expect("translate without table");
+    assert!(t.hlsl.contains("v4 = asuint(i.i0.x);"), "{}", t.hlsl);
+}

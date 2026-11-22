@@ -6305,7 +6305,28 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             }
             let _ = writeln!(init, "    s3 = 0x100u; v0 = 0x04000000u; v1 = 0x800u;");
         }
-        if !is_ps && !self.is_gs {
+        // The FSSM header states the fetch subroutine's output layout per input (first VGPR and
+        // component count); use it when it is there and names only inputs of the signature. The
+        // grouping below is the fallback, and agrees with the table for plain vertex shaders.
+        let table = if ex.stage == Stage::Vertex && self.durango.is_none() { crate::meta::fssm_vertex_inputs(&ex.fssm) } else { Vec::new() };
+        let table_ok = !table.is_empty()
+            && table.iter().all(|t| t.first_vgpr >= 4 && t.first_vgpr + t.count <= 256 && ex.input_sig.iter().any(|e| e.sysval == 0 && e.register == t.register));
+        if !is_ps && !self.is_gs && table_ok {
+            for t in &table {
+                for c in 0..t.count as usize {
+                    let v = format!("v{}", t.first_vgpr as usize + c);
+                    self.regs.insert(v.clone());
+                    let val = match sig_lookup(&ex.input_sig, t.register, c) {
+                        Some((ei, k)) => {
+                            let acc = format!("i.i{ei}.{}", XYZW[k]);
+                            if ex.input_sig[ei].comp_type == 3 { format!("asuint({acc})") } else { format!("(uint)({acc})") }
+                        }
+                        None => (if c == 3 { "0x3f800000u" } else { "0u" }).to_string(),
+                    };
+                    let _ = writeln!(init, "    {v} = {val};");
+                }
+            }
+        } else if !is_ps && !self.is_gs {
             let mut group = 0usize;
             for reg in distinct_regs(ex.input_sig.iter().filter(|e| e.sysval == 0)) {
                 let read = ex.input_sig.iter().any(|e| e.sysval == 0 && e.register == reg && e.rw_mask != 0);
