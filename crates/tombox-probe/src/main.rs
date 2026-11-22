@@ -1,5 +1,7 @@
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap};
+#[cfg(windows)]
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -42,6 +44,7 @@ fn write_json(path: &Path, v: &Value) -> Result<(), String> {
     std::fs::write(path, serde_json::to_string_pretty(v).unwrap()).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
+#[cfg(windows)]
 fn find_ci(dir: &Path, name: &str) -> Option<PathBuf> {
     let want = name.to_ascii_lowercase();
     std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).find(|p| p.is_file() && p.file_name().map(|f| f.to_string_lossy().to_ascii_lowercase() == want).unwrap_or(false))
@@ -68,6 +71,7 @@ fn identifiers_with_prefix(bytes: &[u8], prefix: &str) -> Vec<String> {
     out.into_iter().collect()
 }
 
+#[cfg(windows)]
 fn cmd_scan(a: &Args) -> Result<Value, String> {
     let title = a.need("title")?;
     let bin = PathBuf::from(a.need("bin-dir")?);
@@ -80,6 +84,7 @@ fn sanitize(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect()
 }
 
+#[cfg(windows)]
 fn cmd_load(a: &Args) -> Result<Value, String> {
     use tombox_probe::image::{file_version, Image};
     use tombox_probe::names::{is_api_set, is_vc_redist, normalize_module};
@@ -203,6 +208,7 @@ fn cmd_load(a: &Args) -> Result<Value, String> {
     }))
 }
 
+#[cfg(windows)]
 fn cmd_child(a: &Args) -> Result<Value, String> {
     let plan_path = a.need("plan")?;
     let result = PathBuf::from(a.need("result")?);
@@ -253,9 +259,14 @@ fn main() -> ExitCode {
     };
     let a = Args::parse(&argv[1..]);
     let r = match cmd.as_str() {
+        #[cfg(windows)]
         "scan" => cmd_scan(&a),
+        #[cfg(windows)]
         "load" => cmd_load(&a),
+        #[cfg(windows)]
         "load-child" => cmd_child(&a),
+        #[cfg(not(windows))]
+        "scan" | "load" | "load-child" => Err(format!("{cmd} needs Windows (it loads the modules with the PC loader)")),
         "token" => cmd_token(&a),
         "sites" => cmd_sites(&a),
         _ => Err(format!("unknown command {cmd}")),
