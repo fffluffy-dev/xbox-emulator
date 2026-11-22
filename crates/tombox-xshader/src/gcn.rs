@@ -256,6 +256,9 @@ fn convert(ins: &Insn) -> Result<Vec<u32>, String> {
     let at = ins.offset;
     let lit = ins.words.get(1).copied();
     let err = |e: String| format!("gfx7 at {at:#x} ({w:#010x}): {e}");
+    if ins.words.len() < length(ins.enc, w) {
+        return Err(err(format!("instruction truncated: {} of {} dwords before the end of the code", ins.words.len(), length(ins.enc, w))));
+    }
     Ok(match ins.enc {
         Enc::Sop2 => match (w >> 23) & 0x7f {
             0x00..=0x0b | 0x0e..=0x2a | 0x2c => ins.words.clone(),
@@ -755,6 +758,15 @@ mod tests {
         assert_eq!(d[0].mnemonic, "s_load_dword");
         assert_eq!(d[2].mnemonic, "v_add_co_u32");
         assert_eq!(d.last().unwrap().mnemonic, "s_endpgm");
+    }
+
+    #[test]
+    fn truncated_last_instruction_is_an_error() {
+        // A two-dword encoding (MIMG, MUBUF, VOP3, ...) cut off by the end of the code.
+        for w in [0xf000_0000u32, 0xe000_0000, 0xd200_0000, 0xbe80_03ff] {
+            let e = to_rdna2(&w.to_le_bytes()).err().unwrap_or_else(|| panic!("{w:#010x} lowered"));
+            assert!(e.contains("truncated"), "{w:#010x}: {e}");
+        }
     }
 
     fn words(b: &[u8]) -> Vec<u32> {

@@ -578,6 +578,17 @@ fn bvh_intersect_ray_reads_guest_bvh() {
     }
 }
 
+/// A BVH op whose result (4 VGPRs) or address range runs past v255 is refused, not a panic.
+#[test]
+fn bvh_register_ranges_past_v255_are_refused() {
+    for (label, w1) in [("vdata v253", 0x0000_fd01u32), ("vaddr v250 + 11", 0x0000_14fa)] {
+        let body = [0xf198_0f01, w1, vop1(1, 0, v(20))];
+        let ex = shader(&program(&body), None);
+        let e = translate(&ex).err().unwrap_or_else(|| panic!("{label}: translated"));
+        assert!(e.contains("past v255"), "{label}: {e}");
+    }
+}
+
 fn sopc_eq(a: u32, b: u32) -> u32 {
     0xbf00_0000 | (0x06 << 16) | (b << 8) | a
 }

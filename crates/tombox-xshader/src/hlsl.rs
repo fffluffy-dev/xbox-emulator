@@ -5309,6 +5309,9 @@ impl<'a> Emitter<'a> {
                 Some(Opnd::Vgpr(b)) => *b,
                 _ => return Err("bvh: bad vaddr".into()),
             };
+            if base as usize + need > 256 {
+                return Err(format!("bvh: address registers v[{base}:{}] run past v255", base as usize + need - 1));
+            }
             (0..need as u8).map(|k| Opnd::Vgpr(base + k)).collect()
         } else {
             addrs
@@ -5358,6 +5361,9 @@ impl<'a> Emitter<'a> {
             Opnd::Vgpr(v) => v,
             _ => return Err("bvh: bad vdata".into()),
         };
+        if vd > 252 {
+            return Err(format!("bvh: result registers v[{vd}:{}] run past v255", vd as u32 + 3));
+        }
         for (k, c) in ["x", "y", "z", "w"].iter().enumerate() {
             self.wv(&Opnd::Vgpr(vd + k as u8), &format!("t{t}.{c}"))?;
         }
