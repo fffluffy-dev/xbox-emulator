@@ -60,6 +60,7 @@ jobs:
         --exclude gcxaudioext --exclude xaudio2_9 --exclude wldp
         --exclude gamecorecomproxy --exclude connectedstorageservice_proxystub
         --exclude xg_xs --exclude xbsc_xs --exclude gamehost --exclude compat-common
+        --exclude kerneltracecontrol
     steps:
       - uses: actions/checkout@v4
       - name: libopus sources (third_party/opus, 316c675fa1c9)
@@ -71,6 +72,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: windows-workspace
+      - name: Build the audio DLLs audio_titles loads (target-xaudio)
+        shell: pwsh
+        run: |
+          $env:CARGO_TARGET_DIR = "target-xaudio"
+          cargo build --release -p acphal -p chad -p xapu
+          "AUDIO_TITLES_DLL_DIR=$PWD\target-xaudio\release" >> $env:GITHUB_ENV
       - name: Build workspace
         id: build
         shell: pwsh
@@ -83,6 +90,25 @@ jobs:
         run: |
           cargo test --workspace $($env:EXCLUDE -split ' ') --no-fail-fast 2>&1 | Tee-Object -FilePath test.log
           exit $LASTEXITCODE
+      - name: Test kerneltracecontrol (without the ETW session tests)
+        if: always()
+        shell: pwsh
+        run: |
+          cargo test -p kerneltracecontrol --no-fail-fast -- --skip reaches_etw 2>&1 | Tee-Object -FilePath test-ktc.log
+          exit $LASTEXITCODE
+      # On the runner (admin token) these tests really start ETW sessions, and the test process
+      # did not exit in run #2 after all 15 tests passed. One process per test, time-boxed, to
+      # find the one that keeps it alive.
+      - name: Probe kerneltracecontrol ETW tests (time-boxed)
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 6
+        shell: pwsh
+        run: |
+          foreach ($t in 'start_heap_trace_reaches_etw', 'start_kernel_trace_reaches_etw') {
+            $j = Start-Job -ScriptBlock { param($t, $d) Set-Location $d; cargo test -p kerneltracecontrol --lib -- --exact "tests::$t" 2>&1 } -ArgumentList $t, $PWD
+            if (Wait-Job $j -Timeout 120) { "== $t exited"; Receive-Job $j | Select-Object -Last 8 } else { "== $t DID NOT EXIT within 120 s"; Receive-Job $j | Select-Object -Last 8; Stop-Job $j; Get-Process | Where-Object { $_.Name -like 'kerneltracecontrol-*' } | Stop-Process -Force }
+          }
       - name: Test compat-common (lib)
         if: always()
         shell: pwsh
@@ -96,7 +122,7 @@ jobs:
           "## Build errors" >> $env:GITHUB_STEP_SUMMARY
           if (Test-Path build.log) { Select-String -Path build.log -Pattern '^error' | Select-Object -First 80 | ForEach-Object { "    $($_.Line)" } >> $env:GITHUB_STEP_SUMMARY }
           "## Test results" >> $env:GITHUB_STEP_SUMMARY
-          foreach ($f in 'test.log', 'test-common.log') { if (Test-Path $f) { Select-String -Path $f -Pattern 'test result:|FAILED|panicked|Running ' | Select-Object -First 400 | ForEach-Object { "    $($_.Line)" } >> $env:GITHUB_STEP_SUMMARY } }
+          foreach ($f in 'test.log', 'test-ktc.log', 'test-common.log') { if (Test-Path $f) { Select-String -Path $f -Pattern 'test result:|FAILED|panicked|Running ' | Select-Object -First 400 | ForEach-Object { "    $($_.Line)" } >> $env:GITHUB_STEP_SUMMARY } }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -104,5 +130,22 @@ jobs:
           path: |
             build.log
             test.log
+            test-ktc.log
             test-common.log
           if-no-files-found: ignore
+
+  windows-d3d12-hw:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    continue-on-error: true
+    env:
+      TOMBOX_EXEC_HW: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-d3d12-hw
+      # The d3d12_xs tests marked "needs a D3D12 device/GPU" (#[ignore]): on the runner the only
+      # adapter is the software one, which is what these tests then use.
+      - name: d3d12_xs hardware tests (--ignored hw_)
+        run: cargo test -p d3d12_xs --lib --no-fail-fast hw_ -- --ignored --test-threads=1
