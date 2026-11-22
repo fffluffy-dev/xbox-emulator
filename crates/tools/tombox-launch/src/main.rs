@@ -214,6 +214,45 @@ fn link_tree(src: &Path, dst: &Path, skip: &BTreeSet<String>, copy: bool) -> Res
     Ok(())
 }
 
+fn default_work() -> PathBuf {
+    let base = if cfg!(windows) { std::env::var_os("LOCALAPPDATA") } else { std::env::var_os("HOME") };
+    base.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")).join("tombox-run")
+}
+
+type Snapshot = BTreeMap<PathBuf, (u64, Option<std::time::SystemTime>)>;
+
+fn snapshot(root: &Path) -> Snapshot {
+    let mut out = Snapshot::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let Ok(m) = e.metadata() else { continue };
+            if m.is_dir() {
+                stack.push(e.path());
+            } else {
+                out.insert(e.path(), (m.len(), m.modified().ok()));
+            }
+        }
+    }
+    out
+}
+
+fn changed(before: &Snapshot, after: &Snapshot) -> Vec<String> {
+    let mut v = Vec::new();
+    for (p, m) in after {
+        match before.get(p) {
+            None => v.push(format!("new: {}", p.display())),
+            Some(b) if b != m => v.push(format!("modified: {}", p.display())),
+            _ => {}
+        }
+    }
+    for p in before.keys().filter(|p| !after.contains_key(*p)) {
+        v.push(format!("removed: {}", p.display()));
+    }
+    v
+}
+
 fn report(cfg: &config::GameConfig, exe: &str, plan: &Plan, notes: &[String]) -> String {
     let mut r = String::new();
     let _ = writeln!(r, "# tombox-launch plan\n\n{} {} - {exe}\n", cfg.identity, cfg.version);
@@ -250,8 +289,8 @@ fn run(a: Args) -> Result<(), String> {
     let runtime = a.runtime.clone().ok_or("--runtime is required")?;
     let mut inp = Inputs { prefer_runtime: a.prefer.clone(), extra: a.stage.clone(), ..Default::default() };
     inp.runtime = dll_names(&runtime);
-    if inp.runtime.is_empty() {
-        return Err(format!("{}: no DLLs; build the runtime or unpack the CI bundle there", runtime.display()));
+    if inp.runtime.is_empty() && !a.plan_only {
+        return Err(format!("{}: no DLLs; build the runtime or unpack the CI bundle there (--plan works without them)", runtime.display()));
     }
     for d in &lay.console_dirs {
         inp.console.extend(dll_names(d));
@@ -259,6 +298,9 @@ fn run(a: Args) -> Result<(), String> {
     inp.host = host_dlls(a.prefix.as_deref());
     inp.shipped = dll_names(&lay.mount);
     let mut notes = Vec::new();
+    if inp.runtime.is_empty() {
+        notes.push(format!("{} has no DLLs: every console library shows as missing", runtime.display()));
+    }
     if inp.console.is_empty() {
         notes.push("no EmbeddedXvd/Windows/System32 next to Mount: console libraries are guessed from the runtime".into());
     }
@@ -296,7 +338,7 @@ fn run(a: Args) -> Result<(), String> {
     if a.plan_only {
         return Ok(());
     }
-    let work = a.work.clone().unwrap_or_else(|| PathBuf::from("tombox-run").join(if cfg.identity.is_empty() { "title" } else { &cfg.identity }));
+    let work = a.work.clone().unwrap_or_else(|| default_work().join(if cfg.identity.is_empty() { "title" } else { &cfg.identity }));
     let overlay = work.join("Mount");
     if overlay.exists() {
         std::fs::remove_dir_all(&overlay).map_err(|e| format!("{}: {e}", overlay.display()))?;
@@ -373,8 +415,19 @@ fn run(a: Args) -> Result<(), String> {
         cmd.env("WINEPREFIX", p);
     }
     println!("starting: {prog} {}", args.join(" "));
+    let before = if a.copy { Snapshot::new() } else { snapshot(&lay.mount) };
     let status = cmd.status().map_err(|e| format!("{prog}: {e}"))?;
     println!("exit: {status}");
+    if !a.copy {
+        let ch = changed(&before, &snapshot(&lay.mount));
+        if ch.is_empty() {
+            println!("the dump at {} is unchanged", lay.mount.display());
+        } else {
+            let txt = ch.join("\n");
+            eprintln!("warning: the title wrote into the dump through the overlay links ({} entries); use --copy to isolate it:\n{txt}", ch.len());
+            let _ = std::fs::write(work.join("dump_changes.txt"), txt);
+        }
+    }
     Ok(())
 }
 
@@ -425,6 +478,22 @@ mod tests {
         assert_eq!(a.env, vec![("A".to_string(), "b=c".to_string())]);
         assert_eq!(a.game_args, vec!["-x".to_string()]);
         assert!(parse_args(&["--bogus".into()]).is_err());
+    }
+
+    #[test]
+    fn snapshots_report_new_modified_and_removed_files() {
+        let d = tmp("snap");
+        std::fs::write(d.join("a"), "1").unwrap();
+        std::fs::write(d.join("b"), "2").unwrap();
+        let before = snapshot(&d);
+        std::fs::write(d.join("a"), "longer").unwrap();
+        std::fs::remove_file(d.join("b")).unwrap();
+        std::fs::write(d.join("c"), "3").unwrap();
+        let mut ch = changed(&before, &snapshot(&d));
+        ch.sort();
+        assert_eq!(ch.len(), 3, "{ch:?}");
+        assert!(ch[0].starts_with("modified: ") && ch[1].starts_with("new: ") && ch[2].starts_with("removed: "), "{ch:?}");
+        assert!(changed(&before, &before).is_empty());
     }
 
     #[cfg(unix)]

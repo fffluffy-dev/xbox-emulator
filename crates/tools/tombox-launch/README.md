@@ -23,7 +23,8 @@ What it does:
 5. Writes `<work>/launch_report.md` and `<work>/launch.env`.
    - The runtime environment: `TOMBOX_PACKAGE_ROOT`, `TOMBOX_XBTHUNK_TITLE_ROOT`, `TOMBOX_GDK_ROOT`, `TOMBOX_XCRD_ROOT`, `TOMBOX_COMPAT_DIR`, `TOMBOX_LOG`.
    - Off Windows also `WINEPATH`, so the runtime's own dependencies resolve after the host's system DLLs, and `WINEDLLOVERRIDES=<staged>=n,b`. These are appended to any existing overrides, so vkd3d-proton settings survive.
-6. With `--run`, starts the title in the overlay: directly on Windows (optionally under `--mdbg mdbg.exe`), or with `--wine` / `$WINE` elsewhere (`--prefix` / `$WINEPREFIX` selects the prefix).
+6. Without `--work`, everything goes to `~/tombox-run/<identity>` (`%LOCALAPPDATA%\tombox-run` on Windows). `--plan` reads only and also works before the runtime is built: console libraries then show as missing.
+7. With `--run`, starts the title in the overlay: directly on Windows (optionally under `--mdbg mdbg.exe`), or with `--wine` / `$WINE` elsewhere (`--prefix` / `$WINEPREFIX` selects the prefix).
 
 The runtime DLLs need the MSVC linker. The `runtime-bundle` workflow builds them on GitHub Actions and uploads `tombox-runtime-windows-x64`, which also contains `tombox-launch.exe` and `mdbg.exe`.
 
@@ -35,5 +36,7 @@ tombox-launch ~/Downloads/<package> --runtime ~/tombox-runtime --work ~/tombox-r
 tombox-launch ~/Downloads/<package> --runtime ~/tombox-runtime --work ~/tombox-run/trackmania \
   --wine "$HOME/.steam/steam/steamapps/common/Proton 10.0/files/bin/wine64" --run
 ```
+
+The overlay links point back into the dump. A console package is read-only, so a title should not write there. In case one does, the launcher records the size and modification time of every file in the dump before the run and compares them afterwards. It reports any change in `<work>/dump_changes.txt`. `--copy` isolates the dump completely, at the cost of disk space.
 
 Use only dumps of games you own. The tool does no decryption.
