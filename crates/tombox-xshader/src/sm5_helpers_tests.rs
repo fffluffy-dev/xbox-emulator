@@ -1,12 +1,16 @@
+#[cfg(windows)]
 use std::ffi::c_void;
 
+#[cfg(windows)]
 extern "system" {
     fn LoadLibraryA(n: *const u8) -> *mut c_void;
     fn GetProcAddress(h: *mut c_void, n: *const u8) -> *mut c_void;
 }
 
+#[cfg(windows)]
 type D3DCompile = unsafe extern "system" fn(*const u8, usize, *const u8, *const c_void, *const c_void, *const u8, *const u8, u32, u32, *mut *mut c_void, *mut *mut c_void) -> i32;
 
+#[cfg(windows)]
 unsafe fn release(o: *mut c_void) {
     if !o.is_null() {
         let f: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(*(*(o as *const *const usize)).add(2));
@@ -19,6 +23,7 @@ fn common_helpers_have_no_64bit_integers_for_sm5() {
     assert!(!crate::hlsl::CUBE_HELPERS.contains("uint64_t"), "the always-emitted helper prelude must stay valid ps_5_1 HLSL");
 }
 
+#[cfg(windows)]
 #[test]
 fn common_helpers_compile_with_fxc_ps_5_1() {
     let h = unsafe { LoadLibraryA(b"d3dcompiler_47.dll\0".as_ptr()) };
