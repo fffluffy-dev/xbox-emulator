@@ -332,12 +332,14 @@ fn probe_wave_shuffle(g: &mut Gpu) -> usize {
 /// last lane of each row gets 0.
 fn probe_dpp_fragment(g: &mut Gpu) -> usize {
     let head = "RWByteAddressBuffer io : register(u0);\n[RootSignature(\"UAV(u0)\")]\n[numthreads(32, 1, 1)]\nvoid main(uint3 t : SV_GroupThreadID) {\n    uint l = WaveGetLaneIndex();\n    uint v5 = 0xab000000u + 0x10101u * l + io.Load(0);\n";
-    let cuts: [(&str, &str); 6] = [
+    let cuts: [(&str, &str); 8] = [
         ("translator fragment", "    uint exec_lo = 1u;\n    uint v6 = (0xffffffffu >> (l & 31u)) & 1u;\n    exec_lo = (((exec_lo & 1u) != 0u) && (0u != v6)) ? 1u : 0u;\n    uint t0l = WaveGetLaneIndex(); uint t0r = t0l & 15u; uint t0b = t0l & ~15u; bool t0o = (t0r + 1u < 16u); uint t0s = t0o ? ((t0b + t0r + 1u)) : t0l; uint t0v = WaveReadLaneAt(v5, t0s); bool t0a = WaveReadLaneAt(exec_lo & 1u, t0s) != 0u; bool t0k = t0o && (false || t0a);\n    uint r = t0k ? t0v : 0u;\n"),
         ("row index only", "    uint t0r = l & 15u; uint t0b = l & ~15u; bool t0o = (t0r + 1u < 16u); uint t0s = t0o ? (t0b + t0r + 1u) : l; uint t0v = WaveReadLaneAt(v5, t0s);\n    uint r = t0o ? t0v : 0u;\n"),
         ("row index, select()", "    uint t0r = l & 15u; uint t0b = l & ~15u; bool t0o = (t0r + 1u < 16u); uint t0s = select(t0o, t0b + t0r + 1u, l); uint t0v = WaveReadLaneAt(v5, t0s);\n    uint r = select(t0o, t0v, 0u);\n"),
         ("exec setup, one read", "    uint exec_lo = 1u;\n    uint v6 = (0xffffffffu >> (l & 31u)) & 1u;\n    exec_lo = (((exec_lo & 1u) != 0u) && (0u != v6)) ? 1u : 0u;\n    uint t0r = l & 15u; uint t0b = l & ~15u; bool t0o = (t0r + 1u < 16u); uint t0s = t0o ? (t0b + t0r + 1u) : l; uint t0v = WaveReadLaneAt(v5, t0s);\n    uint r = (t0o && exec_lo != 0u) ? t0v : 0u;\n"),
         ("second read, no exec setup", "    uint exec_lo = 1u;\n    uint t0r = l & 15u; uint t0b = l & ~15u; bool t0o = (t0r + 1u < 16u); uint t0s = t0o ? (t0b + t0r + 1u) : l; uint t0v = WaveReadLaneAt(v5, t0s); bool t0a = WaveReadLaneAt(exec_lo & 1u, t0s) != 0u; bool t0k = t0o && (false || t0a);\n    uint r = t0k ? t0v : 0u;\n"),
+        ("two shuffles, lane-varying second source", "    uint t0r = l & 15u; uint t0b = l & ~15u; bool t0o = (t0r + 1u < 16u); uint t0s = t0o ? (t0b + t0r + 1u) : l; uint t0v = WaveReadLaneAt(v5, t0s); uint t0x = WaveReadLaneAt(l ^ 0x55u, t0s);\n    uint r = (t0o && t0x == ((t0s ^ 0x55u))) ? t0v : 0xdeadu;\n"),
+        ("two shuffles, v6 second source", "    uint v6 = (0xffffffffu >> (l & 31u)) & 1u;\n    uint t0r = l & 15u; uint t0b = l & ~15u; bool t0o = (t0r + 1u < 16u); uint t0s = t0o ? (t0b + t0r + 1u) : l; uint t0v = WaveReadLaneAt(v5, t0s); bool t0a = WaveReadLaneAt(v6, t0s) != 0u;\n    uint r = (t0o && t0a) ? t0v : 0u;\n"),
         ("second read of a varying value", "    uint ex = io.Load(4) | 1u;\n    uint t0r = l & 15u; uint t0b = l & ~15u; bool t0o = (t0r + 1u < 16u); uint t0s = t0o ? (t0b + t0r + 1u) : l; uint t0v = WaveReadLaneAt(v5, t0s); bool t0a = WaveReadLaneAt(ex & 1u, t0s) != 0u;\n    uint r = (t0o && t0a) ? t0v : 0u;\n"),
     ];
     let mut bad = 0;
