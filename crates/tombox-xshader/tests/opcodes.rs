@@ -566,6 +566,52 @@ fn mip_level_uav_access() {
     }
 }
 
+/// MIMG word0 for a 2D image atomic: op, dmask, GLC (return the pre-op value).
+fn img_atomic(op: u32, dmask: u32, glc: bool) -> u32 {
+    0xf000_0000 | op << 18 | (glc as u32) << 13 | dmask << 8 | 1 << 3
+}
+
+#[test]
+fn image_atomics_on_a_uint_uav() {
+    let root = || Some(RootSig { version: 2, flags: 1, params: vec![table(1, 64)], num_static_samplers: 0, static_samplers: Vec::new() });
+    let tgt = "uav0[uint2(v1, v2)]";
+    let cases: Vec<(&str, u32, u32, Vec<String>)> = vec![
+        ("image_atomic_swap", 0x0f, 1, vec![format!("InterlockedExchange({tgt}, v4, t")]),
+        ("image_atomic_cmpswap", 0x10, 3, vec![format!("InterlockedCompareExchange({tgt}, v5, v4, t")]),
+        ("image_atomic_add", 0x11, 1, vec![format!("InterlockedAdd({tgt}, v4, t")]),
+        ("image_atomic_sub", 0x12, 1, vec![format!("InterlockedAdd({tgt}, (0u - v4), t")]),
+        ("image_atomic_smin", 0x14, 1, vec!["asuint(min(asint(t".into(), "InterlockedCompareExchange(".into()]),
+        ("image_atomic_umin", 0x15, 1, vec![format!("InterlockedMin({tgt}, v4, t")]),
+        ("image_atomic_smax", 0x16, 1, vec!["asuint(max(asint(t".into()]),
+        ("image_atomic_umax", 0x17, 1, vec![format!("InterlockedMax({tgt}, v4, t")]),
+        ("image_atomic_and", 0x18, 1, vec![format!("InterlockedAnd({tgt}, v4, t")]),
+        ("image_atomic_or", 0x19, 1, vec![format!("InterlockedOr({tgt}, v4, t")]),
+        ("image_atomic_xor", 0x1a, 1, vec![format!("InterlockedXor({tgt}, v4, t")]),
+        ("image_atomic_inc", 0x1b, 1, vec![">= v4) ? 0u : (".into()]),
+        ("image_atomic_dec", 0x1c, 1, vec!["== 0u) || (".into()]),
+    ];
+    for (name, op, dmask, expect) in cases {
+        let w0 = img_atomic(op, dmask, true);
+        assert_eq!(mnemonic(&[w0, 0x0000_0401]).0, name);
+        let body = [0xf40c_0004, 0xfa00_0000, w0, 0x0000_0401, vop1(1, 0, v(4))];
+        let mut e: Vec<&str> = expect.iter().map(String::as_str).collect();
+        e.push("RWTexture2D<uint> uav0");
+        e.push("v4 = TB_WV(t");
+        check(name, &program(&body), root(), &e);
+    }
+}
+
+/// Without GLC an image atomic returns nothing: vdata keeps the operand.
+#[test]
+fn image_atomic_without_glc_keeps_vdata() {
+    let root = Some(RootSig { version: 2, flags: 1, params: vec![table(1, 64)], num_static_samplers: 0, static_samplers: Vec::new() });
+    let body = [0xf40c_0004, 0xfa00_0000, img_atomic(0x11, 1, false), 0x0000_0401, vop1(1, 0, v(4))];
+    let ex = shader(&program(&body), root);
+    let t = translate(&ex).expect("translate");
+    assert!(t.hlsl.contains("InterlockedAdd(uav0[uint2(v1, v2)], v4, t"), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("v4 = TB_WV(t"), "{}", t.hlsl);
+}
+
 #[test]
 fn bvh_intersect_ray_reads_guest_bvh() {
     let cases: Vec<(&str, Vec<u32>, Vec<&str>)> = vec![
