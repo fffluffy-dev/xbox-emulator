@@ -277,6 +277,34 @@ fn texel_type_follows_the_use_of_the_loaded_value() {
     assert!(t.hlsl.contains("float4 t0 = tex0.Load("), "{}", t.hlsl);
 }
 
+/// Store and atomic data registers are reads. A pixel shader that writes the fragment
+/// position (v2, entry ABI) straight into a UAV must still get v2 initialised from SV_Position;
+/// before, the store's vdata counted as a write and v2 stayed 0.
+#[test]
+fn store_data_registers_count_as_entry_reads() {
+    let root = || Some(RootSig { version: 2, flags: 1, params: vec![table(1, 8, 5)], num_static_samplers: 0, static_samplers: Vec::new() });
+    let mut pos = sig("SV_Position", 1, 3, 0, 0xf);
+    pos.rw_mask = 1;
+    let cases: [(&str, [u32; 2]); 2] = [
+        ("buffer_store_dword v2", [0xe070_0000, 0x8000_0200]),
+        ("image_store v2", [0xf020_0108, 0x0000_0200]),
+    ];
+    for (label, st) in cases {
+        let words = [
+            0xf40c_0004, // s_load_dwordx8 s0, s8: the UAV descriptor
+            0xfa00_0000,
+            0x7e00_0280, // v_mov_b32 v0, 0 (address)
+            0x7e02_0280, // v_mov_b32 v1, 0
+            st[0],
+            st[1],
+            S_ENDPGM,
+        ];
+        let ex = shader(Stage::Pixel, &words, vec![pos.clone()], vec![], root());
+        let t = translate(&ex).unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert!(t.hlsl.contains("v2 = asuint(i.i0.x);"), "{label}:\n{}", t.hlsl);
+    }
+}
+
 #[test]
 fn loops_translate_deterministically() {
     let mut words = Vec::new();
