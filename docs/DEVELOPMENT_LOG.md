@@ -4,6 +4,26 @@ Reverse chronological. Each entry: what was done, evidence, blockers, next actio
 
 ---
 
+## 2026-11-22 — renamed fucking-frankenstein; GTA VI resource model ported from Leonida
+
+- Project renamed **fucking-frankenstein** (README, host window title). The plan is rewritten in
+  `docs/ROADMAP.md`.
+- tombox-xshader memory-descriptor mode ([#24](https://github.com/fffluffy-dev/xbox-emulator/issues/24),
+  [#25](https://github.com/fffluffy-dev/xbox-emulator/pull/25)), after Leonida's runtime contract:
+  - Step 1, buffers. Shaders with no root signature take s0–s31 from cbuffer `TbUser`. They read
+    `s_load` / `s_buffer_load` / MUBUF data at the console GPU address through the global windows,
+    with V# bounds. The GPU test passes on the Steam Deck.
+  - Step 2, images and samplers. A T# / S# is keyed with FNV-1a over its kind and first four
+    dwords, looked up in a runtime table (t0) and taken from `ResourceDescriptorHeap` /
+    `SamplerDescriptorHeap` (SM 6.6). A miss reads a null view and is counted. GPU tests are pushed
+    (CI and Deck pending).
+- Testing without the developer's PC: CI on GitHub Actions (Windows + WARP + DXC) and a Steam Deck
+  as an RDNA2 test machine. Fixes from the Deck: the round-mode fold (#21) and test assumptions
+  (#19). Open: DPP with two shuffles, f64 denormals in `div_f64` / `trig_preop`.
+- Next: memory-descriptor step 3 in d3d12_xs (fill `TbUser`, map windows, keep the T# / S# table).
+
+---
+
 ## 2026-11-21 — past "Checking for updates": login complete, game-mode select
 
 - Backend body logging showed the client requests `grant_type=client_credentials&token_type=eg1`;

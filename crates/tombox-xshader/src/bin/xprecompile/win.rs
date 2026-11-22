@@ -78,7 +78,7 @@ struct Tally {
     compile_ms: u128,
 }
 
-fn main() -> ExitCode {
+pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut inputs: Vec<String> = Vec::new();
     let mut src_dirs: Vec<std::path::PathBuf> = Vec::new();

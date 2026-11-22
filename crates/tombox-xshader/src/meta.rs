@@ -358,3 +358,30 @@ mod fssm_vin_tests {
         assert!(fssm_vertex_inputs(&blob(&[[6, 0, 0xf, 4, 7]])).is_empty(), "component index past w is not a table");
     }
 }
+
+/// Wave size the FSSM header declares: `Some(true)` for wave32, `Some(false)` for wave64 (flags
+/// word u32[0xD4], bit 5), `None` without an FSSM blob. Durango (GCN) blobs are not FSSM-headed
+/// this way and give `None`. Rule from the Leonida project (docs/design.md "Wave size").
+pub fn fssm_wave32(fssm: &[u8]) -> Option<bool> {
+    if fssm.get(0..4) != Some(b"FSSM") {
+        return None;
+    }
+    let w = fssm.get(0xd4..0xd8)?;
+    Some(u32::from_le_bytes([w[0], w[1], w[2], w[3]]) & 0x20 != 0)
+}
+
+#[cfg(test)]
+mod fssm_wave_tests {
+    use super::fssm_wave32;
+
+    #[test]
+    fn flags_word_bit5_is_wave32() {
+        let mut b = vec![0u8; 0x100];
+        b[0..4].copy_from_slice(b"FSSM");
+        assert_eq!(fssm_wave32(&b), Some(false));
+        b[0xd4] = 0x20;
+        assert_eq!(fssm_wave32(&b), Some(true));
+        assert_eq!(fssm_wave32(&b[..0xd6]), None);
+        assert_eq!(fssm_wave32(&[]), None);
+    }
+}

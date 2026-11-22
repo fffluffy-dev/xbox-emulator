@@ -33,7 +33,7 @@ mod centroid;
 mod durango;
 mod mixed;
 mod mimg_d16;
-use mimg_d16::{mimg_data_regs, Lane};
+use mimg_d16::{mimg_data_regs, mimg_tfe, Lane};
 
 pub struct Translated {
     pub hlsl: String,
@@ -125,9 +125,10 @@ float3 tb_cube_dir(float s, float t, float face) { float u = (s - 1.5) * 2.0, v 
 int tb_nrm(float v, uint k) { uint b = asuint(v); uint a = b & 0x7fffffffu; if (a < 0x30000000u) return 0; uint sh = 150u - (a >> 23); uint m = (a & 0x7fffffu) | 0x800000u; uint lo = m * k; uint hi = tb_mulhi_u32(m, k); uint q, rh, rl, hh, hl; if (sh >= 32u) { q = hi >> (sh - 32u); rh = hi & ((1u << (sh - 32u)) - 1u); rl = lo; } else { q = (lo >> sh) | (hi << (32u - sh)); rh = 0u; rl = lo & ((1u << sh) - 1u); } if (sh >= 33u) { hh = 1u << (sh - 33u); hl = 0u; } else { hh = 0u; hl = 1u << (sh - 1u); } bool gt = rh > hh || (rh == hh && rl > hl); bool eq = rh == hh && rl == hl; if (gt || (eq && (q & 1u) != 0u)) q += 1u; int r = (int)q; return (b >> 31) != 0u ? -r : r; }
 float tb_rev(float x) { return (abs(x) < 0.5) ? x : x - round(x); }
 float tb_ldexp32(float x, int e) { int k = clamp(e, -330, 330); return (float)((double)x * asdouble(0u, (uint)(k + 1023) << 20)); }
-float tb_rto(double s) { float f = (float)s; if ((double)f != s) { uint u = asuint(f); if (abs((double)f) > abs(s)) u -= 1u; f = asfloat(u | 1u); } return f; }
+double tb_f2d(float x) { uint b = asuint(x); uint e = (b >> 23) & 0xffu; uint m = b & 0x7fffffu; uint sg = b & 0x80000000u; if (e == 0u) { double d = (double)(float)m * asdouble(0u, 0x36a00000u); return sg != 0u ? -d : d; } return asdouble((m & 7u) << 29, sg | ((e == 0xffu) ? 0x7ff00000u : ((e + 896u) << 20)) | (m >> 3)); }
+float tb_rto(double s) { float f = (float)s; if (tb_f2d(f) != s) { uint u = asuint(f); if (abs(tb_f2d(f)) > abs(s)) u -= 1u; f = asfloat(u | 1u); } return f; }
 float tb_fma16(float a, float b, float c) { precise float p = a * b; precise float s = p + c; if ((asuint(s) & 0x7fffffffu) >= 0x7f800000u) return s; precise float bb = s - p; precise float e = (p - (s - bb)) + (c - bb); uint u = asuint(s); if (e != 0.0) { if ((e > 0.0) != (s > 0.0)) u -= 1u; u |= 1u; } return asfloat(u); }
-float tb_fma_rto(float a, float b, float c) { precise double p = (double)a * (double)b; precise double q = (double)c; precise double s = p + q; if (!(abs(s) < 1.0e300)) return (float)s; precise double bb = s - p; precise double e = (p - (s - bb)) + (q - bb); float f = (float)s; uint u = asuint(f); if ((double)f != s) { if (abs((double)f) > abs(s)) u -= 1u; u |= 1u; } else if (e != 0.0) { if ((e > 0.0) != (s > 0.0)) u -= 1u; u |= 1u; } return asfloat(u); }
+float tb_fma_rto(float a, float b, float c) { precise double p = (double)a * (double)b; precise double q = (double)c; precise double s = p + q; if (!(abs(s) < 1.0e300)) return (float)s; precise double bb = s - p; precise double e = (p - (s - bb)) + (q - bb); float f = (float)s; uint u = asuint(f); if (tb_f2d(f) != s) { if (abs(tb_f2d(f)) > abs(s)) u -= 1u; u |= 1u; } else if (e != 0.0) { if ((e > 0.0) != (s > 0.0)) u -= 1u; u |= 1u; } return asfloat(u); }
 float tb_mull(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }
 #ifdef TB_FAST_FMA
 float tb_fma(float a, float b, float c) { precise float r = mad(a, b, c); uint m = 0x7fffffffu; uint xa = asuint(a) & m, xb = asuint(b) & m, xc = asuint(c) & m; if (max(max(xa, xb), xc) > 0x7f800000u) return asfloat(((xa > 0x7f800000u) ? asuint(a) : ((xb > 0x7f800000u) ? asuint(b) : asuint(c))) | 0x400000u); return ((asuint(r) & m) > 0x7f800000u) ? asfloat(0x7fc00000u) : r; }
@@ -294,6 +295,36 @@ fn sig_lookup(sig: &[SigElement], register: u32, chan: usize) -> Option<(usize, 
 }
 
 /// Distinct registers of the given elements, in signature order.
+/// Data registers a buffer/image store or atomic reads from its vdata field (decoded as `dst`),
+/// and whether it also writes vdata back (atomics with GLC). `None` for every other op.
+fn store_data_regs(ins: &Insn) -> Option<(u32, bool)> {
+    let m = ins.mnemonic.as_str();
+    let atomic = m.contains("_atomic_");
+    if !(m.contains("_store") || atomic) {
+        return None;
+    }
+    let glc = match ins.enc {
+        Enc::Mubuf | Enc::Mtbuf => ins.aux.mask & 4 != 0,
+        Enc::Mimg => ins.raw.first().is_some_and(|w| (w >> 13) & 1 != 0),
+        _ => return None,
+    };
+    let n = if ins.enc == Enc::Mimg {
+        mimg_data_regs(ins)
+    } else if atomic {
+        (if m.ends_with("_x2") { 2 } else { 1 }) * (if m.contains("cmpswap") { 2 } else { 1 })
+    } else {
+        let tail = m.rsplit('_').next().unwrap_or("");
+        let comps = match tail {
+            "dwordx2" | "xy" => 2,
+            "dwordx3" | "xyz" => 3,
+            "dwordx4" | "xyzw" => 4,
+            _ => 1,
+        };
+        if m.contains("_d16") { (comps + 1) / 2 } else { comps }
+    };
+    Some((n, atomic && glc))
+}
+
 fn distinct_regs<'s>(it: impl Iterator<Item = &'s SigElement>) -> Vec<u32> {
     let mut v: Vec<u32> = Vec::new();
     for e in it {
@@ -2161,11 +2192,23 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
+            // Store and atomic data sits in the decoded `dst` slot but is read by the op.
+            if let (Some((n, writes)), Some(Opnd::Vgpr(vd))) = (store_data_regs(ins), ins.dst.first()) {
+                for k in 0..n {
+                    let r = *vd as u32 + k;
+                    if !written.contains(&format!("v{r}")) {
+                        live.insert((1, r));
+                    }
+                }
+                if !writes {
+                    continue;
+                }
+            }
             // Multi-register destinations: SMEM loads, MIMG results, 64-bit scalar ops.
             let extra = match ins.enc {
                 Enc::Smem if matches!(ins.op, 0x24 | 0x25) => 1,
                 Enc::Smem => (1u32 << (ins.op & 7)) - 1,
-                Enc::Mimg => mimg_data_regs(ins).saturating_sub(1),
+                Enc::Mimg => (mimg_data_regs(ins) + mimg_tfe(ins) as u32).saturating_sub(1),
                 _ if ins.mnemonic.ends_with("_b64") => 1,
                 _ => 0,
             };
@@ -5309,6 +5352,9 @@ impl<'a> Emitter<'a> {
                 Some(Opnd::Vgpr(b)) => *b,
                 _ => return Err("bvh: bad vaddr".into()),
             };
+            if base as usize + need > 256 {
+                return Err(format!("bvh: address registers v[{base}:{}] run past v255", base as usize + need - 1));
+            }
             (0..need as u8).map(|k| Opnd::Vgpr(base + k)).collect()
         } else {
             addrs
@@ -5358,6 +5404,9 @@ impl<'a> Emitter<'a> {
             Opnd::Vgpr(v) => v,
             _ => return Err("bvh: bad vdata".into()),
         };
+        if vd > 252 {
+            return Err(format!("bvh: result registers v[{vd}:{}] run past v255", vd as u32 + 3));
+        }
         for (k, c) in ["x", "y", "z", "w"].iter().enumerate() {
             self.wv(&Opnd::Vgpr(vd + k as u8), &format!("t{t}.{c}"))?;
         }
@@ -5365,6 +5414,22 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_mimg(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
+        self.emit_mimg_op(idx, ins)?;
+        // TFE: the texel-fail status lands in the VGPR after the returned data. Every D3D12
+        // resource the translator binds is fully resident, so the status is always 0
+        // (resident, no LOD warning); a shader that tests it must see that, not a stale value.
+        if mimg_tfe(ins) {
+            let vd = match ins.dst.first() {
+                Some(Opnd::Vgpr(n)) => *n,
+                _ => return Err("bad vdata".into()),
+            };
+            let st = u8::try_from(vd as u32 + mimg_data_regs(ins)).map_err(|_| format!("{}: TFE status register past v255", ins.mnemonic))?;
+            self.wv(&Opnd::Vgpr(st), "0u")?;
+        }
+        Ok(())
+    }
+
+    fn emit_mimg_op(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
         if ins.mnemonic.starts_with("image_bvh") {
             return self.emit_bvh(ins);
         }
@@ -5410,7 +5475,7 @@ impl<'a> Emitter<'a> {
             return Ok(());
         }
         // Texel-addressed ops (no sampler): image_load / image_store, on SRVs or UAVs.
-        if matches!(ins.mnemonic.as_str(), "image_load" | "image_load_mip" | "image_store" | "image_store_mip" | "image_atomic_add" | "image_atomic_umax") {
+        if matches!(ins.mnemonic.as_str(), "image_load" | "image_load_mip" | "image_store" | "image_store_mip") || ins.mnemonic.starts_with("image_atomic_") {
             let with_mip = ins.mnemonic == "image_load_mip" || ins.mnemonic == "image_store_mip";
             let store = ins.mnemonic.starts_with("image_store");
             let (slot, dim, is_uav) = match rs.first() {
@@ -5459,14 +5524,58 @@ impl<'a> Emitter<'a> {
                 if !as_uint {
                     return Err("image atomic on a non-UAV table".into());
                 }
-                let func = if ins.mnemonic == "image_atomic_add" { "InterlockedAdd" } else { "InterlockedMax" };
+                // GLC (word0 bit 13) selects whether the pre-op value is returned; without it
+                // vdata keeps the operand.
+                let glc = ins.raw.first().is_some_and(|w| (w >> 13) & 1 != 0);
+                // dmask gives the data width: 1 (cmpswap 3) for 32-bit, 3 (cmpswap 0xf) for the
+                // 64-bit forms, which a RWTexture<uint> texel cannot hold.
+                let want = if ins.mnemonic == "image_atomic_cmpswap" { 3 } else { 1 };
+                if ins.aux.mask & 0xf != want {
+                    return Err(format!("{} with dmask {:#x}: only the 32-bit form is supported", ins.mnemonic, ins.aux.mask & 0xf));
+                }
                 let o = Opnd::Vgpr(vd);
                 self.touch(&o);
+                let val = r(&o)?;
+                let target = format!("{uobj}[uint{ncoord}({})]", c.join(", "));
                 let t = self.tmp;
                 self.tmp += 1;
-                self.line(&format!("uint t{t} = 0u;"));
-                self.line(&format!("if (exec_lo & 1u) {func}({uobj}[uint{ncoord}({})], {}, t{t});", c.join(", "), r(&o)?));
-                return self.wv(&o, &format!("t{t}"));
+                let op = &ins.mnemonic["image_atomic_".len()..];
+                let direct = match op {
+                    "add" => Some(("InterlockedAdd", val.clone())),
+                    "sub" => Some(("InterlockedAdd", format!("(0u - {val})"))),
+                    "umin" => Some(("InterlockedMin", val.clone())),
+                    "umax" => Some(("InterlockedMax", val.clone())),
+                    "and" => Some(("InterlockedAnd", val.clone())),
+                    "or" => Some(("InterlockedOr", val.clone())),
+                    "xor" => Some(("InterlockedXor", val.clone())),
+                    "swap" => Some(("InterlockedExchange", val.clone())),
+                    _ => None,
+                };
+                if let Some((func, arg)) = direct {
+                    self.line(&format!("uint t{t} = 0u; if (exec_lo & 1u) {{ {func}({target}, {arg}, t{t}); }}"));
+                } else if op == "cmpswap" {
+                    // vdata = {source, compare}; the texel takes the source when it equals compare.
+                    let cmp = Opnd::Vgpr(vd.checked_add(1).ok_or("image_atomic_cmpswap: compare register past v255")?);
+                    self.touch(&cmp);
+                    self.line(&format!("uint t{t} = 0u; if (exec_lo & 1u) {{ InterlockedCompareExchange({target}, {}, {val}, t{t}); }}", r(&cmp)?));
+                } else {
+                    // No HLSL texel op with these semantics: compare-exchange loop.
+                    let cv = format!("t{t}c");
+                    let new = match op {
+                        "smin" => format!("asuint(min(asint({cv}), asint({val})))"),
+                        "smax" => format!("asuint(max(asint({cv}), asint({val})))"),
+                        "inc" => format!("(({cv} >= {val}) ? 0u : ({cv} + 1u))"),
+                        "dec" => format!("((({cv} == 0u) || ({cv} > {val})) ? {val} : ({cv} - 1u))"),
+                        _ => return Err(format!("{} unsupported", ins.mnemonic)),
+                    };
+                    self.line(&format!(
+                        "uint t{t} = 0u; if (exec_lo & 1u) {{ uint {cv} = {target}; [allow_uav_condition] for (uint t{t}i = 0u; t{t}i < 1024u; t{t}i++) {{ uint t{t}p = 0u; InterlockedCompareExchange({target}, {cv}, {new}, t{t}p); if (t{t}p == {cv}) break; {cv} = t{t}p; }} t{t} = {cv}; }}"
+                    ));
+                }
+                if glc {
+                    self.wv(&o, &format!("t{t}"))?;
+                }
+                return Ok(());
             }
             if store && as_uint {
                 let v = self.mimg_store_lanes(ins, vd, Lane::Uint, "0u")?;

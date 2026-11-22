@@ -1,8 +1,6 @@
-#[path = "../../tools/xreplay/src/d3d.rs"]
-#[allow(dead_code)]
-mod d3d;
 
 use core::ffi::c_void;
+use crate::{d3d, vcall};
 use d3d::Gpu;
 use tombox_xshader::dxc;
 
@@ -150,7 +148,7 @@ unsafe fn run(g: &mut Gpu, code: &[u8], cases: &[[u32; 3]]) -> Result<Vec<[u32; 
     Ok(out[obase as usize..].chunks(8).map(|c| [u32::from_le_bytes(c[0..4].try_into().unwrap()), u32::from_le_bytes(c[4..8].try_into().unwrap())]).collect())
 }
 
-fn main() {
+pub fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
         eprintln!("usage: fma_gpu_diff <old_tb_fma.hlsl> <new_tb_fma.hlsl> [million cases] [batches]");
