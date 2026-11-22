@@ -23,6 +23,7 @@ members = [
     "crates/compat/opus",
     "crates/compat/mfplat",
     "crates/compat/mflnmhelp",
+    "crates/compat/xgameruntime",
     "crates/compat/xfp_gc",
     "crates/compat/mfh264dec",
     "crates/compat/mfhevcdec",

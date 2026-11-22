@@ -18,6 +18,8 @@ const USAGE: &str = "tombox-launch <dump or Mount dir> --runtime <dir with the r
   --prefix DIR         Wine prefix (default: $WINEPREFIX); its system32 is the host DLL set
   --wine CMD           Wine / Proton wine64 used to start the title off Windows (default: $WINE or wine)
   --mdbg PATH          start the title under mdbg.exe (OutputDebugString and exception trace)
+  --into-prefix NAME   also copy the runtime's NAME into the Wine prefix's system32, for DLLs a title
+                       loads from System32 only (repeatable; never overwrites a different file)
   --copy               copy the package instead of linking it (needed across volumes on Windows)
   --plan               only print the plan; touch nothing
   --run                start the title after staging
@@ -33,6 +35,7 @@ struct Args {
     prefer: BTreeSet<String>,
     env: Vec<(String, String)>,
     prefix: Option<PathBuf>,
+    into_prefix: BTreeSet<String>,
     wine: Option<String>,
     mdbg: Option<PathBuf>,
     copy: bool,
@@ -65,6 +68,9 @@ fn parse_args(v: &[String]) -> Result<Args, String> {
                 a.env.push((k.to_string(), val.to_string()));
             }
             "--prefix" => a.prefix = Some(PathBuf::from(next(&mut i)?)),
+            "--into-prefix" => {
+                a.into_prefix.insert(lower(&next(&mut i)?));
+            }
             "--wine" => a.wine = Some(next(&mut i)?),
             "--mdbg" => a.mdbg = Some(PathBuf::from(next(&mut i)?)),
             "--copy" => a.copy = true,
@@ -330,6 +336,9 @@ fn run(a: Args) -> Result<(), String> {
             }
         }
     }
+    if !cfg!(windows) && inp.host.is_some() && plan.stage.contains("xgameruntime.dll") && !a.into_prefix.contains("xgameruntime.dll") {
+        notes.push("xgameruntime.dll is staged beside the executable; if the title loads it from System32 only, add --into-prefix xgameruntime.dll".into());
+    }
     for (src, c) in &companions {
         notes.push(format!("{c}: copy of the host's {src} (the runtime's {src} forwards to it)"));
     }
@@ -358,6 +367,23 @@ fn run(a: Args) -> Result<(), String> {
             }
             None => eprintln!("warning: no host {src} to stage as {c}"),
         }
+    }
+    for n in &a.into_prefix {
+        if cfg!(windows) {
+            return Err("--into-prefix is for Wine prefixes only".into());
+        }
+        let dir = host_system32(a.prefix.as_deref()).ok_or("--into-prefix needs --prefix or $WINEPREFIX")?;
+        let src = find_ci(&runtime, n).ok_or_else(|| format!("--into-prefix {n}: not in the runtime"))?;
+        let dst = dir.join(src.file_name().unwrap());
+        let bytes = std::fs::read(&src).map_err(|e| format!("{}: {e}", src.display()))?;
+        match find_ci(&dir, n) {
+            Some(existing) if std::fs::read(&existing).ok().as_deref() != Some(&bytes[..]) => {
+                return Err(format!("--into-prefix {n}: {} exists and differs; remove it yourself if it is not needed", existing.display()));
+            }
+            Some(_) => {}
+            None => std::fs::write(&dst, &bytes).map_err(|e| format!("{}: {e}", dst.display()))?,
+        }
+        println!("{n} is in the prefix: {}", dst.display());
     }
     let gdk = work.join("gdkroot");
     let logs = work.join("logs");

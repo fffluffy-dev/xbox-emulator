@@ -26,6 +26,8 @@ What it does:
 6. Without `--work`, everything goes to `~/tombox-run/<identity>` (`%LOCALAPPDATA%\tombox-run` on Windows). `--plan` reads only and also works before the runtime is built: console libraries then show as missing.
 7. With `--run`, starts the title in the overlay: directly on Windows (optionally under `--mdbg mdbg.exe`), or with `--wine` / `$WINE` elsewhere (`--prefix` / `$WINEPREFIX` selects the prefix).
 
+Wine has no Microsoft Gaming Runtime. The runtime's `xgameruntime.dll` (crate `crates/compat/xgameruntime`) stands in for it: its `QueryApiImpl` answers `E_NOINTERFACE`, and the compat-common GDK runtime, which hooks that entry point, serves every interface it emulates. On Windows the host's own `xgameruntime.dll` is used, and the stand-in is not staged. For a title that loads it from System32 only, `--into-prefix xgameruntime.dll` copies it into the Wine prefix. It never overwrites a different file.
+
 The runtime DLLs need the MSVC linker. The `runtime-bundle` workflow builds them on GitHub Actions and uploads `tombox-runtime-windows-x64`, which also contains `tombox-launch.exe` and `mdbg.exe`.
 
 Steam Deck example (Proton 10, the prefix the GPU tests use):

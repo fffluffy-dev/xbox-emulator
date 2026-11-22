@@ -942,6 +942,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "xgameruntime"
+version = "0.1.0"
+dependencies = [
+ "xone-exports",
+]
+
+[[package]]
 name = "xgs-kmd-emu"
 version = "0.1.0"
 dependencies = [
