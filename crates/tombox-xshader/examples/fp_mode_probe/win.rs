@@ -181,6 +181,7 @@ pub fn main() {
     }
     bad += probe_round_mode(&mut g);
     bad += probe_wave_shuffle(&mut g);
+    bad += probe_dpp_fragment(&mut g);
     println!("{}", if bad == 0 { "fp_mode_probe: all conformant" } else { "fp_mode_probe: non-conformant results above" });
     std::process::exit(if bad == 0 { 0 } else { 1 });
 }
@@ -246,7 +247,7 @@ fn mode_helpers() -> String {
 /// the step where the mode is lost is visible.
 fn probe_round_mode(g: &mut Gpu) -> usize {
     let src = format!(
-        "RWByteAddressBuffer io : register(u0);\ndouble tb_f2d(float x) {{ uint b = asuint(x); uint e = (b >> 23) & 0xffu; if (e == 0u || e == 0xffu) return (double)x; return asdouble((b & 7u) << 29, (b & 0x80000000u) | ((e + 896u) << 20) | ((b & 0x7fffffu) >> 3)); }}\n{}[RootSignature(\"UAV(u0)\")]\n[numthreads(1, 1, 1)]\nvoid main() {{\n    uint4 x = io.Load4(0);\n    float a = asfloat(x.x), b = asfloat(x.y), c = asfloat(x.z); uint m = x.w;\n    precise float r = a + b; precise double e = tb_res2((double)a, (double)b, r); float q = tb_m_add(a, b, m);\n    uint el, eh; asuint(e, el, eh);\n    io.Store4(64, uint4(asuint(r), el, eh, asuint(q)));\n    precise double p = (double)c * (double)c; precise float r2 = (float)p; precise double e2 = p - (double)r2; float q2 = tb_m_mul(c, c, m);\n    uint fl, fh; asuint(e2, fl, fh);\n    io.Store4(80, uint4(asuint(r2), fl, fh, asuint(q2)));\n    precise double ea = fma((double)c, (double)c, -(double)r2);\n    double dc = tb_f2d(c);\n    precise double pb = dc * dc;\n    precise double eb = pb - (double)r2;\n    uint al, ah, bl, bh; asuint(ea, al, ah); asuint(eb, bl, bh);\n    io.Store4(96, uint4(al, ah, bl, bh));\n}}\n",
+        "RWByteAddressBuffer io : register(u0);\ndouble tb_f2d(float x) {{ uint b = asuint(x); uint e = (b >> 23) & 0xffu; if (e == 0u || e == 0xffu) return (double)x; return asdouble((b & 7u) << 29, (b & 0x80000000u) | ((e + 896u) << 20) | ((b & 0x7fffffu) >> 3)); }}\n{}[RootSignature(\"UAV(u0)\")]\n[numthreads(1, 1, 1)]\nvoid main() {{\n    uint4 x = io.Load4(0);\n    float a = asfloat(x.x), b = asfloat(x.y), c = asfloat(x.z); uint m = x.w;\n    precise float r = a + b; precise double e = tb_res2((double)a, (double)b, r); float q = tb_m_add(a, b, m);\n    uint el, eh; asuint(e, el, eh);\n    io.Store4(64, uint4(asuint(r), el, eh, asuint(q)));\n    precise double p = (double)c * (double)c; precise float r2 = (float)p; precise double e2 = p - (double)r2; float q2 = tb_m_mul(c, c, m);\n    uint fl, fh; asuint(e2, fl, fh);\n    io.Store4(80, uint4(asuint(r2), fl, fh, asuint(q2)));\n    precise double ea = fma((double)c, (double)c, -(double)r2);\n    double dc = tb_f2d(c);\n    precise double pb = dc * dc;\n    precise double eb = pb - (double)r2;\n    uint al, ah, bl, bh; asuint(ea, al, ah); asuint(eb, bl, bh);\n    io.Store4(96, uint4(al, ah, bl, bh));\n    precise double rt = (double)r2;\n    precise double ec = p - tb_f2d(r2);\n    uint rl, rh, cl, ch; asuint(rt, rl, rh); asuint(ec, cl, ch);\n    io.Store4(112, uint4(rl, rh, cl, ch));\n}}\n",
         mode_helpers()
     );
     let mut bad = 0;
@@ -274,7 +275,9 @@ fn probe_round_mode(g: &mut Gpu) -> usize {
                 bad += 1;
             }
             // Workarounds for the product error term: (a) fma in f64, (b) operands widened bitwise.
-            for (name, base) in [("product error via fma", 24usize), ("product error via bitwise f2d", 26)] {
+            let rt = (o[29] as u64) << 32 | o[28] as u64;
+            println!("round-mode (double)(float)p: {rt:#018x} (want 0x3ff0000040000000 = (double)0x3f800002; 0x3ff0000040000040 (= p) would mean the round trip was folded away)");
+            for (name, base) in [("product error via fma", 24usize), ("product error via bitwise f2d", 26), ("product error p - tb_f2d(r)", 30)] {
                 let e = (o[base + 1] as u64) << 32 | o[base] as u64;
                 let ok = e == 0x3d10_0000_0000_0000;
                 println!("round-mode {name}: e={e:#018x} (want 0x3d10000000000000) {}", if ok { "ok" } else { "BAD" });
@@ -321,4 +324,47 @@ fn probe_wave_shuffle(g: &mut Gpu) -> usize {
             1
         }
     }
+}
+
+/// DPP row_shr:1 as the translator emits it (v_mov_b32 with DPP16 inside rows of 16 lanes),
+/// in three cuts, to find what breaks the shuffle on implementations where a plain
+/// non-uniform WaveReadLaneAt works. Lane l of a row reads lane l + 1 of the same row; the
+/// last lane of each row gets 0.
+fn probe_dpp_fragment(g: &mut Gpu) -> usize {
+    let head = "RWByteAddressBuffer io : register(u0);\n[RootSignature(\"UAV(u0)\")]\n[numthreads(32, 1, 1)]\nvoid main(uint3 t : SV_GroupThreadID) {\n    uint l = WaveGetLaneIndex();\n    uint v5 = 0xab000000u + 0x10101u * l + io.Load(0);\n";
+    let cuts: [(&str, &str); 3] = [
+        ("translator fragment", "    uint exec_lo = 1u;\n    uint v6 = (0xffffffffu >> (l & 31u)) & 1u;\n    exec_lo = (((exec_lo & 1u) != 0u) && (0u != v6)) ? 1u : 0u;\n    uint t0l = WaveGetLaneIndex(); uint t0r = t0l & 15u; uint t0b = t0l & ~15u; bool t0o = (t0r + 1u < 16u); uint t0s = t0o ? ((t0b + t0r + 1u)) : t0l; uint t0v = WaveReadLaneAt(v5, t0s); bool t0a = WaveReadLaneAt(exec_lo & 1u, t0s) != 0u; bool t0k = t0o && (false || t0a);\n    uint r = t0k ? t0v : 0u;\n"),
+        ("row index only", "    uint t0r = l & 15u; uint t0b = l & ~15u; bool t0o = (t0r + 1u < 16u); uint t0s = t0o ? (t0b + t0r + 1u) : l; uint t0v = WaveReadLaneAt(v5, t0s);\n    uint r = t0o ? t0v : 0u;\n"),
+        ("row index, select()", "    uint t0r = l & 15u; uint t0b = l & ~15u; bool t0o = (t0r + 1u < 16u); uint t0s = select(t0o, t0b + t0r + 1u, l); uint t0v = WaveReadLaneAt(v5, t0s);\n    uint r = select(t0o, t0v, 0u);\n"),
+    ];
+    let mut bad = 0;
+    for (name, body) in cuts {
+        let src = format!("{head}{body}    io.Store(64 + t.x * 4u, r);\n}}\n");
+        let code = match dxc::compile(&src, "cs_6_2") {
+            Ok(c) => c,
+            Err(e) => {
+                println!("dpp {name}: compile failed: {}", e.lines().next().unwrap_or(""));
+                bad += 1;
+                continue;
+            }
+        };
+        match unsafe { run_raw(g, &code, &[0]) } {
+            Ok(o) => {
+                let got: Vec<u32> = (0..32).map(|t| o[16 + t]).collect();
+                let want: Vec<u32> = (0..32u32).map(|l| if (l & 15) < 15 { 0xab00_0000 + 0x10101 * (l + 1) } else { 0 }).collect();
+                if got == want {
+                    println!("dpp {name}: ok");
+                } else {
+                    bad += 1;
+                    let own = (0..32u32).filter(|&l| got[l as usize] == 0xab00_0000 + 0x10101 * l).count();
+                    println!("dpp {name}: BAD ({own}/32 lanes read their own value) got {:08x?} want {:08x?}", &got[..4], &want[..4]);
+                }
+            }
+            Err(e) => {
+                println!("dpp {name}: run failed: {e}");
+                bad += 1;
+            }
+        }
+    }
+    bad
 }
