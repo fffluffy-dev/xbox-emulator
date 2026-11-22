@@ -552,6 +552,13 @@ fn hw_db_count_sample_rate_on_4x_msaa() {
     }
 }
 
+/// D3D12_FEATURE_D3D12_OPTIONS2 (18): { BOOL DepthBoundsTestSupported; tier } on the host device.
+unsafe fn depth_bounds_supported(dev: usize) -> bool {
+    let mut opts = [0u32; 2];
+    let hr = unsafe { vc!(dev, 13, fn(u32, *mut c_void, u32) -> i32, 18, opts.as_mut_ptr() as *mut c_void, 8) };
+    hr >= 0 && opts[0] != 0
+}
+
 unsafe fn bounds(k: &Kit, lo: f32, hi: f32) {
     unsafe {
         let f: unsafe extern "system" fn(*mut c_void, f32, f32) = x(k, X_DEPTH_BOUNDS);
@@ -591,14 +598,22 @@ fn hw_db_count_replays_every_draw_path() {
         let vs = k._vs.clone();
         let ps = k._ps.clone();
         let bpso = make_stream_pso(&k, (SUB_VS, &vs), &ps, probe_ds(Some(true)));
-        for (ctrl, want, what) in [
+        // The depth-bounds cases need D3D12_OPTIONS2.DepthBoundsTestSupported: without it the
+        // device ignores OMSetDepthBounds and every bounds count reads as if the test passed.
+        let bounds_cases: &[(Option<u32>, u64, &str)] = if depth_bounds_supported(k.dev) {
+            &[
             (None, 0u64, "bounds default"),
             (Some(0x1110_0000), 2048, "bounds dbfail"),
             (Some(0x1101_0000), 1024, "bounds sfail"),
             (Some(0x1100_1000), 1024, "bounds zfail"),
             (Some(0x1111_1100), 4096, "bounds all categories"),
             (Some(0x1110_0120), 8192, "bounds dbfail at rate 4"),
-        ] {
+            ]
+        } else {
+            eprintln!("depth bounds test not supported by this adapter (D3D12_OPTIONS2): bounds cases skipped");
+            &[]
+        };
+        for &(ctrl, want, what) in bounds_cases {
             let dsv = k.dsv;
             let got = measure_with(&mut k, &p, dsv, ctrl, 0, &|k| {
                 set_pso(k, bpso);
