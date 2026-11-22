@@ -862,12 +862,18 @@ mod tests {
             let mut info = [0u64; 2];
             let md = tex_desc(4);
             vc!(dev, 25, fn(*mut u64, u32, u32, *const u8) -> *mut u64, info.as_mut_ptr(), 0, 1, md.as_ptr());
-            let off_step = crate::alias::create_placed_x(dev, r + 0x31_0000, &md, 0x1_0000, 4, core::ptr::null(), &mut t3);
+            let off_step = crate::alias::create_placed_x(dev, r + 0x31_0000, &md, 0x1_0000, 4, core::ptr::null(), &mut t3).expect("MSAA larger than its title layout gets its own heap at any 64 KB step");
+            assert_eq!(off_step.offset, 0);
+            assert_ne!(off_step.heap, m1.heap);
+            assert!(crate::msaa_place::capable(off_step.heap) || info[1] < crate::msaa_place::MSAA_ALIGN);
+            vc!(t3, 2, fn() -> u32);
+            let mut t4: *mut c_void = core::ptr::null_mut();
+            let same = crate::alias::create_placed_x(dev, r + 0x31_0000, &md, info[0], 4, core::ptr::null(), &mut t4);
             if info[1] >= crate::msaa_place::MSAA_ALIGN {
-                assert!(off_step.is_none(), "MSAA off a 4 MB step of its heap falls back to a committed resource");
+                assert!(same.is_none(), "MSAA that fits its title layout but sits off a 4 MB step of the shared heap falls back to a committed resource");
             } else {
-                assert!(off_step.is_some(), "this adapter places MSAA at {:#x}, so any 64 KB step works", info[1]);
-                vc!(t3, 2, fn() -> u32);
+                assert!(same.is_some(), "this adapter places MSAA at {:#x}, so any 64 KB step works", info[1]);
+                vc!(t4, 2, fn() -> u32);
             }
             for t in [t1, t2] {
                 vc!(t, 2, fn() -> u32);

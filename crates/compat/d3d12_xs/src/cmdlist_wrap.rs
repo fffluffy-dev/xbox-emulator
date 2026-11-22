@@ -41,6 +41,16 @@ pub(crate) unsafe fn real_method(slot: usize) -> usize {
     unsafe { *REAL_VT_PTR.add(slot) }
 }
 
+pub(crate) unsafe fn pc_method(list: *mut c_void, slot: usize) -> usize {
+    let vt = unsafe { *(list as *const *const usize) };
+    let xbox = XBOX_VT.as_ptr() as *const usize;
+    if vt == xbox && !unsafe { REAL_VT_PTR }.is_null() {
+        unsafe { *REAL_VT_PTR.add(slot) }
+    } else {
+        unsafe { *vt.add(slot) }
+    }
+}
+
 pub(crate) fn vt_get(i: usize) -> usize {
     XBOX_VT[i].load(Ordering::Relaxed)
 }
@@ -267,6 +277,11 @@ pub fn flush_hits() -> usize {
 unsafe extern "system" fn copy_texture_region_owned(this: *mut c_void, dst: *const u8, x: u32, y: u32, z: u32, src: *const u8, src_box: *const c_void) {
     if !dst.is_null() {
         crate::placed::note_gpu_write(core::ptr::read_unaligned(dst as *const u64) as *mut c_void);
+        let d = core::ptr::read_unaligned(dst as *const u64) as usize;
+        if crate::res3d::is_3d(d) {
+            let s = if src.is_null() { 0 } else { core::ptr::read_unaligned(src as *const u64) as usize };
+            crate::res3d::note(d, "CopyTextureRegion", &format!("at ({x},{y},{z}) src={s:#x} srcType={}", if src.is_null() { 9 } else { core::ptr::read_unaligned(src.add(8) as *const u32) }));
+        }
     }
     let f: unsafe extern "system" fn(*mut c_void, *const u8, u32, u32, u32, *const u8, *const c_void) =
         core::mem::transmute(*REAL_VT_PTR.add(16));
@@ -275,6 +290,7 @@ unsafe extern "system" fn copy_texture_region_owned(this: *mut c_void, dst: *con
 
 unsafe extern "system" fn copy_resource_owned(this: *mut c_void, dst: *mut c_void, src: *mut c_void) {
     crate::placed::note_gpu_write(dst);
+    crate::res3d::note(dst as usize, "CopyResource", &format!("src={src:p}"));
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) = core::mem::transmute(*REAL_VT_PTR.add(17));
     f(this, dst, src)
 }
@@ -307,6 +323,8 @@ unsafe extern "system" fn copy_texture_region_x(
         return;
     }
     crate::placed::note_gpu_write(q(dst, 0) as *mut c_void);
+    crate::res3d::scan_grid_upload(q(dst, 0) as usize, q(src, 0) as *mut c_void, q(src, 16), d(src, 24), d(src, 28), d(src, 32), d(src, 36), d(src, 40));
+    crate::res3d::note(q(dst, 0) as usize, "CopyTextureRegionX", &format!("at ({x},{y},{z}) src={:#x} type={} off={:#x} fmt={} {}x{}x{} pitch={}", q(src, 0), d(src, 8), q(src, 16), d(src, 24), d(src, 28), d(src, 32), d(src, 36), d(src, 40)));
     let f: unsafe extern "system" fn(*mut c_void, *const u8, u32, u32, u32, *const u8, *const c_void) =
         core::mem::transmute(*REAL_VT_PTR.add(16));
     f(this, dst, x, y, z, src, src_box);
@@ -321,6 +339,7 @@ unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: *mut c_void, s
         return;
     }
     crate::placed::note_gpu_write(dst);
+    crate::res3d::note(dst as usize, "CopyResourceX", &format!("src={src:p} flags={flags:#x}"));
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) = core::mem::transmute(*REAL_VT_PTR.add(17));
     f(this, dst, src);
 }
@@ -393,7 +412,10 @@ pub fn apply(real_list: *mut c_void) {
             crate::dbcount::install(&XBOX_VT);
             crate::cl_console_fix::install_family_tail(&XBOX_VT);
             crate::resolve_x::install(&XBOX_VT);
+            crate::dred_marks::install(&XBOX_VT);
+            crate::depth_uav::install_cmdlist(&XBOX_VT);
             crate::pso_async::install(&XBOX_VT);
+            crate::cbv_raw::install_draw_check(&XBOX_VT);
             XBOX_VT[CONSOLE_NULL_SLOT].store(0, Ordering::Relaxed);
             record("d3d12_xs", "cmdlist.vtable",
                 &format!("built Xbox-layout cmdlist vtable from real {real_vt:p} (+4 shift at PC28)"));

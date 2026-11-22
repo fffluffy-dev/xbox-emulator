@@ -3,14 +3,13 @@
 //! Xbox shader blob (DXBC wrapper → XDAT → zlib → FSSM → RDNA2) → HLSL (tombox-xshader)
 //! → DXC (`dxcompiler.dll`, SM6 DXIL; FXC/`D3DCompile` SM5 DXBC as fallback) → cached bytecode.
 //! Each unique shader is translated once per process (keyed by an FNV-1a hash of its
-//! bytes). Failures are cached too and reported with the reason; failing shaders are
-//! dumped to `%TEMP%\tombox_shaders` so coverage can be extended offline with `xshader`.
 
 use compat_common::record;
 use core::ffi::c_void;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use tombox_xshader::hlsl::InputInterp;
 
 type Cached = Result<Arc<Vec<u8>>, Arc<String>>;
 static CACHE: OnceLock<Mutex<HashMap<u64, Arc<OnceLock<Cached>>>>> = OnceLock::new();
@@ -36,7 +35,7 @@ pub fn origin_hash(code: usize) -> Option<u64> {
 }
 
 pub fn origin(code: usize) -> Option<(u64, Arc<Vec<u8>>)> {
-    ORIGIN.get()?.lock().unwrap().get(&code).cloned()
+    ORIGIN.get()?.lock().unwrap_or_else(|e| e.into_inner()).get(&code).cloned()
 }
 
 pub(crate) fn fnv1a(b: &[u8]) -> u64 {
@@ -159,15 +158,15 @@ pub fn disable_loop_grad(hlsl: &str) -> String {
     tombox_xshader::runtime_hlsl::disable_loop_grad(hlsl)
 }
 
-fn translate_uncached(blob: &[u8], hash: u64, rtfmt: &[u8; 8]) -> Result<Vec<u8>, String> {
-    translate_uncached_with(blob, hash, rtfmt, None, None)
+fn translate_uncached(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp) -> Result<Vec<u8>, String> {
+    translate_uncached_with(blob, hash, rtfmt, link, None, None)
 }
 
 pub(crate) fn translate_edited(blob: &[u8], hash: u64, rtfmt: &[u8; 8], edit: &dyn Fn(&str) -> Result<String, String>) -> Result<Vec<u8>, String> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| translate_uncached_with(blob, hash, rtfmt, Some(edit), None))).unwrap_or_else(|_| Err("translator panicked".to_string()))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| translate_uncached_with(blob, hash, rtfmt, &InputInterp::default(), Some(edit), None))).unwrap_or_else(|_| Err("translator panicked".to_string()))
 }
 
-fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], edit: Option<&dyn Fn(&str) -> Result<String, String>>, root: Option<&[u8]>) -> Result<Vec<u8>, String> {
+fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, edit: Option<&dyn Fn(&str) -> Result<String, String>>, root: Option<&[u8]>) -> Result<Vec<u8>, String> {
     let t_start = std::time::Instant::now();
     let mut ex = tombox_xshader::extract(blob).map_err(|e| {
         dump_failure(hash, blob, None, &e);
@@ -176,7 +175,7 @@ fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], edit: Option
     if let Some(root) = root.filter(|_| !ex.has_root_sig) {
         ex.root_sig = Some(tombox_xshader::parse_root_signature(root).map_err(|e| format!("pipeline root signature: {e}"))?);
     }
-    let mut t = tombox_xshader::hlsl::translate(&ex).map_err(|e| {
+    let mut t = tombox_xshader::hlsl::translate_linked(&ex, Some(link)).map_err(|e| {
         dump_failure(hash, blob, None, &e);
         format!("translate: {e}")
     })?;
@@ -189,6 +188,9 @@ fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], edit: Option
             dump_failure(hash, blob, None, &e);
             format!("bind: {e}")
         })?;
+        if let Some((slot, lim, _)) = crate::cbv_raw::clamp_knob().filter(|k| k.2.map_or(true, |h| h == hash)) {
+            t.hlsl = crate::cbv_raw::clamp_reads(&t.hlsl, slot, lim);
+        }
     }
     let needs = crate::mip_bind::Needs::of(&t);
     crate::mip_bind::note(hash, &needs);
@@ -205,6 +207,28 @@ fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], edit: Option
     if let Ok(h) = std::fs::read_to_string(std::env::temp_dir().join("tombox_shader_override").join(format!("{hash:016x}.hlsl"))) {
         record("d3d12_xs", "shader_xlat", &format!("OVERRIDE: hash={hash:016x} uses hand-edited HLSL ({} bytes)", h.len()));
         t.hlsl = h;
+    }
+    if stub_hashes().contains(&hash) {
+        if let Some(k) = t.hlsl.find(" o = (SOut)0;") {
+            let e = k + t.hlsl[k..].find('\n').map_or(0, |x| x + 1);
+            t.hlsl.insert_str(e, "    return o;\n");
+            record("d3d12_xs", "shader_xlat", &format!("STUB: hash={hash:016x} returns its zeroed outputs (TOMBOX_XS_STUB)"));
+        }
+    }
+    if let Some(&(_, lo, hi)) = drop_reads().iter().find(|(h, _, _)| *h == hash) {
+        let (out, n) = drop_read_lines(&t.hlsl, lo, hi);
+        t.hlsl = out;
+        record("d3d12_xs", "shader_xlat", &format!("DROP: hash={hash:016x} dropped {n} memory reads in ISA {lo:#06x}..={hi:#06x} (TOMBOX_XS_DROP)"));
+    }
+    if let Some(&(_, off)) = stub_at().iter().find(|(h, _)| *h == hash) {
+        let tag = format!("// {off:#06x} ");
+        if let Some(k) = t.hlsl.find(&tag) {
+            let ls = t.hlsl[..k].rfind('\n').map_or(0, |x| x + 1);
+            t.hlsl.insert_str(ls, "    return o;\n");
+            record("d3d12_xs", "shader_xlat", &format!("STUB_AT: hash={hash:016x} returns before ISA {off:#06x} (TOMBOX_XS_STUB_AT)"));
+        } else {
+            record("d3d12_xs", "shader_xlat", &format!("STUB_AT: hash={hash:016x} has no ISA line {off:#06x}"));
+        }
     }
     t.hlsl = tombox_xshader::runtime_hlsl::finalize(&t.hlsl, rtfmt, loop_grad());
     // Compiler: DXC (SM6 DXIL) when dxcompiler.dll + dxil.dll are available, otherwise FXC
@@ -226,23 +250,23 @@ fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], edit: Option
             return Err("edited translation needs DXC".to_string());
         }
         let h = edit(&t.hlsl)?;
-        return tombox_xshader::dxc::compile(&h, &profile);
+        if !edited_pack() {
+            return tombox_xshader::dxc::compile(&h, &profile);
+        }
+        return tombox_xshader::shader_cache::compile_cached_with(&h, &profile, fma_mode(), &["edited-plain-compile"], || tombox_xshader::dxc::compile(&h, &profile)).map(|c| c.code);
     }
     if use_dxc {
         let xlat_ms = t_start.elapsed().as_secs_f64() * 1000.0;
         let dir = std::env::temp_dir().join("tombox_shaders");
         let inflight = dir.join(format!("inflight_{hash:016x}.dxbc"));
         let fma = fma_mode();
-        let k = tombox_xshader::shader_cache::key(&t.hlsl, &profile, fma, "");
-        let hit = tombox_xshader::shader_cache::contains(k);
-        if !hit {
+        let r = tombox_xshader::shader_cache::compile_cached_with(&t.hlsl, &profile, fma, &[], || {
             let _ = std::fs::create_dir_all(&dir);
             let _ = std::fs::write(&inflight, blob);
-        }
-        let r = tombox_xshader::shader_cache::compile_cached(&t.hlsl, &profile, fma, &[]);
-        if !hit {
+            let compiled = tombox_xshader::dxc::compile_fma(&t.hlsl, &profile, fma, &[]);
             let _ = std::fs::remove_file(&inflight);
-        }
+            compiled
+        });
         return match r {
             Ok(c) => {
                 note_timing(xlat_ms, c.lookup_ms, c.dxc_ms, c.source == tombox_xshader::shader_cache::Source::Pack);
@@ -302,13 +326,13 @@ fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], edit: Option
 /// Translate an Xbox shader blob to PC bytecode (cached). `ptr/len` come from a
 /// D3D12_SHADER_BYTECODE in the title's PSO desc.
 pub unsafe fn translate(ptr: *const u8, len: usize) -> Cached {
-    translate_for_targets(ptr, len, [0; 8])
+    translate_for_targets(ptr, len, [0; 8], &no_link())
 }
 
-pub fn retranslate(blob: &Arc<Vec<u8>>, hash: u64, rtfmt: [u8; 8]) -> Result<Arc<Vec<u8>>, String> {
-    let v = std::panic::catch_unwind(|| translate_uncached(blob, hash, &rtfmt)).unwrap_or_else(|_| Err("translator panicked".to_string()))?;
+pub fn retranslate(blob: &Arc<Vec<u8>>, hash: u64, rtfmt: [u8; 8], link: &InputInterp) -> Result<Arc<Vec<u8>>, String> {
+    let v = std::panic::catch_unwind(|| translate_uncached(blob, hash, &rtfmt, link)).unwrap_or_else(|_| Err("translator panicked".to_string()))?;
     let v = Arc::new(v);
-    ORIGIN.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().insert(v.as_ptr() as usize, (hash, blob.clone()));
+    ORIGIN.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner()).insert(v.as_ptr() as usize, (hash, blob.clone()));
     Ok(v)
 }
 
@@ -330,6 +354,28 @@ pub fn export_formats(num_rt: u32, formats: &[u32; 8]) -> [u8; 8] {
 
 pub fn cache_key(hash: u64, rtfmt: &[u8; 8]) -> u64 {
     if rtfmt.iter().any(|&k| k != 0) { hash ^ fnv1a(rtfmt).rotate_left(17) } else { hash }
+}
+
+pub fn link_key(key: u64, link: &InputInterp) -> u64 {
+    if link.0.is_empty() { key } else { key ^ fnv1a(format!("{:?}", link.0).as_bytes()).rotate_left(29) }
+}
+
+pub fn ps_link(ps: &[u8], pc_centroid: bool) -> Arc<InputInterp> {
+    static LINKS: LazyLock<Mutex<HashMap<u64, Arc<InputInterp>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    let h = fnv1a(ps) ^ pc_centroid as u64;
+    if let Some(l) = LINKS.lock().unwrap_or_else(|e| e.into_inner()).get(&h) {
+        return l.clone();
+    }
+    let ex = std::panic::catch_unwind(|| tombox_xshader::extract(ps)).ok().and_then(Result::ok);
+    let l = ex.map(|ex| tombox_xshader::hlsl::ps_input_interp(&ex)).unwrap_or_default();
+    let l = Arc::new(if pc_centroid { l.pc_centroid() } else { l });
+    LINKS.lock().unwrap_or_else(|e| e.into_inner()).insert(h, l.clone());
+    l
+}
+
+pub fn no_link() -> Arc<InputInterp> {
+    static NONE: LazyLock<Arc<InputInterp>> = LazyLock::new(Default::default);
+    NONE.clone()
 }
 
 pub fn rtfmt_hex(rtfmt: &[u8; 8]) -> String {
@@ -422,12 +468,41 @@ fn write_atomic(p: &std::path::Path, data: &[u8]) {
 
 static PREWARMED: AtomicUsize = AtomicUsize::new(0);
 
-fn produce(blob: &[u8], hash: u64, rtfmt: &[u8; 8], _key: u64) -> Result<Vec<u8>, String> {
-    let r = std::panic::catch_unwind(|| translate_uncached(blob, hash, rtfmt)).unwrap_or_else(|_| Err("translator panicked".to_string()));
+fn edited_pack() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        let on = std::env::var("TOMBOX_EDITED_PACK").map(|v| v != "0").unwrap_or(true);
+        record("d3d12_xs", "shader_xlat", if on { "edited variants (vs_snorm, ps depth/stencil, dbcount strip) are compiled through the shader pack keyed by their final HLSL (TOMBOX_EDITED_PACK=0 compiles them every time)" } else { "TOMBOX_EDITED_PACK=0: edited variants are compiled every time" });
+        on
+    })
+}
+
+fn index_ctx() -> &'static str {
+    static C: OnceLock<String> = OnceLock::new();
+    C.get_or_init(|| {
+        let f = fma_mode();
+        format!("dxc={} cbv_raw={} loop_grad={} fma={}{}{}{}", tombox_xshader::dxc::available(), crate::cbv_raw::enabled(), loop_grad(), f.preserve as u8, f.any as u8, f.hybrid as u8, f.f2h as u8)
+    })
+}
+
+fn produce(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, _key: u64) -> Result<Vec<u8>, String> {
+    let ik = crate::xlat_index::key(blob, hash, rtfmt, link, index_ctx());
+    let hit = ik.and_then(crate::xlat_index::get);
+    let r = match hit {
+        Some(v) => Ok(v),
+        None => {
+            let t0 = std::time::Instant::now();
+            let r = std::panic::catch_unwind(|| translate_uncached(blob, hash, rtfmt, link)).unwrap_or_else(|_| Err("translator panicked".to_string()));
+            if let (Some(k), Ok(v)) = (ik, &r) {
+                crate::xlat_index::put(k, v, t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            r
+        }
+    };
     if let Ok(v) = &r {
         crate::dbcount::note_translated(v, blob, hash, rtfmt);
         let sp = src_path(hash, rtfmt);
-        if !sp.exists() {
+        if link.0.is_empty() && !sp.exists() {
             write_atomic(&sp, blob);
         }
     }
@@ -436,12 +511,12 @@ fn produce(blob: &[u8], hash: u64, rtfmt: &[u8; 8], _key: u64) -> Result<Vec<u8>
 
 fn cell(key: u64) -> Arc<OnceLock<Cached>> {
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    cache.lock().unwrap().entry(key).or_insert_with(|| Arc::new(OnceLock::new())).clone()
+    cache.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_insert_with(|| Arc::new(OnceLock::new())).clone()
 }
 
 fn mesh_root_cell(hash: u64, root: &[u8]) -> Arc<OnceLock<Cached>> {
     let cache = MESH_ROOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache.lock().unwrap();
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
     let roots = cache.entry(hash).or_default();
     if let Some(entry) = roots.get(root) {
         return entry.clone();
@@ -465,7 +540,7 @@ fn finish_with(res: Result<Vec<u8>, String>, hash: u64, len: usize, origin_blob:
             let v = Arc::new(v);
             note_origin_hash(v.as_ptr() as usize, hash);
             if let Some(blob) = origin_blob.filter(|_| crate::rtcap::enabled() || crate::hot_reload::enabled()) {
-                ORIGIN.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().insert(v.as_ptr() as usize, (hash, Arc::new(blob.to_vec())));
+                ORIGIN.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner()).insert(v.as_ptr() as usize, (hash, Arc::new(blob.to_vec())));
             }
             Ok(v)
         }
@@ -483,6 +558,28 @@ fn finish_with(res: Result<Vec<u8>, String>, hash: u64, len: usize, origin_blob:
 extern "system" {
     fn GetCurrentThread() -> *mut c_void;
     fn SetThreadPriority(h: *mut c_void, p: i32) -> i32;
+    fn GetThreadPriority(h: *mut c_void) -> i32;
+    fn GetCurrentThreadId() -> u32;
+    fn OpenThread(access: u32, inherit: i32, id: u32) -> *mut c_void;
+}
+
+const PREWARM_PRIORITY: i32 = -1;
+const THREAD_SET_QUERY: u32 = 0x0020 | 0x0040;
+static BOOSTS: AtomicUsize = AtomicUsize::new(0);
+
+fn prewarm_busy() -> &'static Mutex<HashMap<u64, usize>> {
+    static M: OnceLock<Mutex<HashMap<u64, usize>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn boost_prewarm(key: u64) {
+    let Some(h) = prewarm_busy().lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied() else { return };
+    let want = unsafe { GetThreadPriority(GetCurrentThread()) }.clamp(0, 2);
+    unsafe { SetThreadPriority(h as *mut c_void, want) };
+    let n = BOOSTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n % 50 == 0 {
+        record("d3d12_xs", "shader_xlat", &format!("a waiting thread boosted the prewarm worker translating key {key:016x} to priority {want} (#{n})"));
+    }
 }
 
 pub fn start_prewarm() {
@@ -527,11 +624,12 @@ pub fn start_prewarm() {
         for _ in 0..workers {
             let q = queue.clone();
             let _ = std::thread::Builder::new().name("tombox-shader-prewarm".into()).spawn(move || {
-                unsafe { SetThreadPriority(GetCurrentThread(), -2) };
+                unsafe { SetThreadPriority(GetCurrentThread(), PREWARM_PRIORITY) };
+                let me = unsafe { OpenThread(THREAD_SET_QUERY, 0, GetCurrentThreadId()) } as usize;
                 let t0 = std::time::Instant::now();
                 let mut done = 0usize;
                 loop {
-                    let next = q.lock().unwrap().pop();
+                    let next = q.lock().unwrap_or_else(|e| e.into_inner()).pop();
                     let Some((p, h, rt)) = next else { break };
                     let Ok(blob) = std::fs::read(&p) else { continue };
                     if fnv1a(&blob) != h {
@@ -543,7 +641,15 @@ pub fn start_prewarm() {
                     let mut ran = false;
                     c.get_or_init(|| {
                         ran = true;
-                        finish(produce(&blob, h, &rt, key), h, blob.len(), &blob)
+                        if me != 0 {
+                            prewarm_busy().lock().unwrap_or_else(|e| e.into_inner()).insert(key, me);
+                        }
+                        let r = finish(produce(&blob, h, &rt, &InputInterp::default(), key), h, blob.len(), &blob);
+                        if me != 0 {
+                            prewarm_busy().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+                            unsafe { SetThreadPriority(GetCurrentThread(), PREWARM_PRIORITY) };
+                        }
+                        r
                     });
                     if ran {
                         done += 1;
@@ -578,25 +684,26 @@ fn helper_pool() -> &'static Mutex<std::sync::mpsc::Sender<Job>> {
     })
 }
 
-pub unsafe fn prefetch(ptr: *const u8, len: usize, rtfmt: [u8; 8]) -> bool {
+pub unsafe fn prefetch(ptr: *const u8, len: usize, rtfmt: [u8; 8], link: &Arc<InputInterp>) -> bool {
     if ptr.is_null() || len < 32 || len > 0x40_0000 {
         return false;
     }
     let blob = core::slice::from_raw_parts(ptr, len);
     let hash = fnv1a(blob);
-    let key = cache_key(hash, &rtfmt);
+    let key = link_key(cache_key(hash, &rtfmt), link);
     let c = cell(key);
     if c.get().is_some() {
         return false;
     }
     let blob = Arc::new(blob.to_vec());
+    let link = link.clone();
     let job: Job = Box::new(move || {
-        c.get_or_init(|| crate::perf::timed(crate::perf::SHADER, || finish(produce(&blob, hash, &rtfmt, key), hash, blob.len(), &blob)));
+        c.get_or_init(|| crate::perf::timed(crate::perf::SHADER, || finish(produce(&blob, hash, &rtfmt, &link, key), hash, blob.len(), &blob)));
     });
     helper_pool().lock().unwrap_or_else(|e| e.into_inner()).send(job).is_ok()
 }
 
-pub unsafe fn translate_for_targets(ptr: *const u8, len: usize, rtfmt: [u8; 8]) -> Cached {
+pub unsafe fn translate_for_targets(ptr: *const u8, len: usize, rtfmt: [u8; 8], link: &InputInterp) -> Cached {
     if ptr.is_null() || len < 32 || len > 0x40_0000 {
         return Err(Arc::new(format!("bad shader blob ({ptr:p}, {len})")));
     }
@@ -605,7 +712,7 @@ pub unsafe fn translate_for_targets(ptr: *const u8, len: usize, rtfmt: [u8; 8]) 
     let hash = fnv1a(blob);
     crate::shader_dump::note(blob, hash, &rtfmt, None);
     let fmt_key = rtfmt.iter().any(|&k| k != 0);
-    let key = cache_key(hash, &rtfmt);
+    let key = link_key(cache_key(hash, &rtfmt), link);
     let c = cell(key);
     if let Some(hit) = c.get() {
         return hit.clone();
@@ -616,8 +723,15 @@ pub unsafe fn translate_for_targets(ptr: *const u8, len: usize, rtfmt: [u8; 8]) 
             record("d3d12_xs", "shader_xlat", &format!("export-format PS hash={hash:016x} rtfmt={rtfmt:?} (1=fp16 RTZ, 2=r11g11b10)"));
         }
     }
+    if !link.0.is_empty() {
+        static LINKN: AtomicUsize = AtomicUsize::new(0);
+        if LINKN.fetch_add(1, Ordering::Relaxed) < 12 {
+            record("d3d12_xs", "shader_xlat", &format!("hash={hash:016x} feeds a pixel shader with interpolation modifiers {:?}", link.0));
+        }
+    }
     let t0 = std::time::Instant::now();
-    let entry = c.get_or_init(|| crate::perf::timed(crate::perf::SHADER, || finish(produce(blob, hash, &rtfmt, key), hash, len, blob))).clone();
+    boost_prewarm(key);
+    let entry = c.get_or_init(|| crate::perf::timed(crate::perf::SHADER, || finish(produce(blob, hash, &rtfmt, link, key), hash, len, blob))).clone();
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     if ms > 1.0 {
         BLOCKED_US.fetch_add((ms * 1000.0) as u64, Ordering::Relaxed);
@@ -637,13 +751,13 @@ pub fn needs_external_root_data(blob: &[u8]) -> bool {
         && tombox_xshader::Dxbc::parse(blob).is_ok_and(|dxbc| dxbc.chunk(b"RTS0").is_none())
 }
 
-pub fn translate_mesh_with_root(blob: &[u8], root: &[u8]) -> Cached {
+pub fn translate_mesh_with_root(blob: &[u8], root: &[u8], link: &InputInterp) -> Cached {
     let hash = fnv1a(blob);
     crate::shader_dump::note(blob, hash, &[0; 8], Some(root));
-    let entry = mesh_root_cell(hash, root);
+    let entry = mesh_root_cell(link_key(hash, link), root);
     entry.get_or_init(|| {
         crate::perf::timed(crate::perf::SHADER, || {
-            let result = std::panic::catch_unwind(|| translate_uncached_with(blob, hash, &[0; 8], None, Some(root)))
+            let result = std::panic::catch_unwind(|| translate_uncached_with(blob, hash, &[0; 8], link, None, Some(root)))
                 .unwrap_or_else(|_| Err("translator panicked".to_string()));
             finish_with(result, hash, blob.len(), None)
         })
@@ -657,6 +771,29 @@ pub fn counts() -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn poison<T: Send + 'static>(m: &'static Mutex<T>) {
+        let _ = std::thread::spawn(move || {
+            let _g = m.lock();
+            panic!("poison");
+        })
+        .join();
+        assert!(m.is_poisoned());
+    }
+
+    #[test]
+    fn poisoned_shader_globals_recover_instead_of_panicking() {
+        poison(ORIGIN.get_or_init(|| Mutex::new(HashMap::new())));
+        poison(CACHE.get_or_init(|| Mutex::new(HashMap::new())));
+        poison(MESH_ROOT_CACHE.get_or_init(|| Mutex::new(HashMap::new())));
+        let out = finish(Ok(vec![4, 3, 2, 1]), 0x0dd0_0000_0000_0109, 4, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(origin_hash(out.as_ptr() as usize), Some(0x0dd0_0000_0000_0109));
+        assert!(origin(1).is_none());
+        let a = cell(0x0109);
+        assert!(Arc::ptr_eq(&a, &cell(0x0109)));
+        let r = mesh_root_cell(0x0109, &[9]);
+        assert!(Arc::ptr_eq(&r, &mesh_root_cell(0x0109, &[9])));
+    }
 
     #[test]
     fn mesh_pipeline_root_cache_separates_layouts_and_keeps_embedded_roots() {
@@ -679,7 +816,7 @@ mod tests {
     #[test]
     fn mesh_root_translation_is_not_recorded_as_a_replayable_origin() {
         let out = finish_with(Ok(vec![5, 6, 7, 8]), 0x0bad_cafe_0000_0001, 4, None).unwrap();
-        assert!(ORIGIN.get().map_or(true, |m| !m.lock().unwrap().contains_key(&(out.as_ptr() as usize))));
+        assert!(ORIGIN.get().map_or(true, |m| !m.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&(out.as_ptr() as usize))));
     }
 
     #[test]
@@ -692,16 +829,16 @@ mod tests {
 
     #[test]
     fn prefetch_rejects_bad_blobs_and_known_shaders() {
-        assert!(!unsafe { prefetch(core::ptr::null(), 64, [0; 8]) });
+        assert!(!unsafe { prefetch(core::ptr::null(), 64, [0; 8], &no_link()) });
         let blob = vec![7u8; 16];
-        assert!(!unsafe { prefetch(blob.as_ptr(), blob.len(), [0; 8]) });
+        assert!(!unsafe { prefetch(blob.as_ptr(), blob.len(), [0; 8], &no_link()) });
         let known = vec![0x5au8; 64];
         let key = cache_key(fnv1a(&known), &[0; 8]);
         let _ = cell(key).set(Ok(Arc::new(vec![1])));
-        assert!(!unsafe { prefetch(known.as_ptr(), known.len(), [0; 8]) });
+        assert!(!unsafe { prefetch(known.as_ptr(), known.len(), [0; 8], &no_link()) });
         let sent = std::sync::mpsc::channel::<u8>();
         let job: Job = Box::new(move || { let _ = sent.0.send(9); });
-        assert!(helper_pool().lock().unwrap().send(job).is_ok());
+        assert!(helper_pool().lock().unwrap_or_else(|e| e.into_inner()).send(job).is_ok());
         assert_eq!(sent.1.recv_timeout(std::time::Duration::from_secs(5)), Ok(9));
     }
 
@@ -732,5 +869,88 @@ mod tests {
         assert_eq!(cache_key(5, &[0; 8]), 5);
         assert_ne!(cache_key(5, &rt), 5);
     }
+
+    #[test]
+    fn feeding_stage_key_follows_the_pixel_shader_modifiers() {
+        let centroid = InputInterp(vec![("TEXCOORD1_centroid0".into(), "centroid".into())]);
+        let other = InputInterp(vec![("TEXCOORD2_centroid0".into(), "centroid".into())]);
+        let key = cache_key(5, &[0; 8]);
+        assert_eq!(link_key(key, &no_link()), key);
+        assert_ne!(link_key(key, &centroid), key);
+        assert_ne!(link_key(key, &centroid), link_key(key, &other));
+        assert_eq!(link_key(key, &centroid), link_key(key, &centroid.clone()));
+        let junk = vec![0x11u8; 64];
+        assert!(ps_link(&junk, false).0.is_empty());
+        assert!(Arc::ptr_eq(&ps_link(&junk, true), &ps_link(&junk, true)));
+        assert_eq!(InputInterp(vec![("T0".into(), "TB_CEN_Q".into())]).pc_centroid().0[0].1, "centroid");
+    }
 }
 
+fn stub_hashes() -> &'static Vec<u64> {
+    static S: OnceLock<Vec<u64>> = OnceLock::new();
+    S.get_or_init(|| std::env::var("TOMBOX_XS_STUB").map(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect()).unwrap_or_default())
+}
+
+fn stub_at() -> &'static Vec<(u64, u32)> {
+    static S: OnceLock<Vec<(u64, u32)>> = OnceLock::new();
+    S.get_or_init(|| {
+        std::env::var("TOMBOX_XS_STUB_AT")
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|e| {
+                        let (h, o) = e.trim().split_once(':')?;
+                        Some((u64::from_str_radix(h, 16).ok()?, u32::from_str_radix(o.trim_start_matches("0x"), 16).ok()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+fn drop_reads() -> &'static Vec<(u64, u32, u32)> {
+    static S: OnceLock<Vec<(u64, u32, u32)>> = OnceLock::new();
+    S.get_or_init(|| {
+        std::env::var("TOMBOX_XS_DROP")
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|e| {
+                        let (h, r) = e.trim().split_once(':')?;
+                        let (a, b) = r.split_once('-')?;
+                        let p = |s: &str| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+                        Some((u64::from_str_radix(h, 16).ok()?, p(a)?, p(b)?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+pub fn drop_read_lines(hlsl: &str, lo: u32, hi: u32) -> (String, usize) {
+    let mut out = String::with_capacity(hlsl.len());
+    let mut dropping = false;
+    let mut n = 0;
+    for l in hlsl.split_inclusive('\n') {
+        let s = l.trim_start();
+        if let Some(rest) = s.strip_prefix("// 0x") {
+            let mut it = rest.split_whitespace();
+            let off = it.next().and_then(|o| u32::from_str_radix(o, 16).ok());
+            let m = it.next().unwrap_or("");
+            dropping = off.is_some_and(|o| o >= lo && o <= hi) && drop_ops().iter().any(|p| m.starts_with(p.as_str()));
+            if dropping {
+                n += 1;
+            }
+            out.push_str(l);
+            continue;
+        }
+        let keep = !dropping || s.starts_with('#') || s.contains("tb_pc") || s.contains("tb_sel") || s.trim_end().chars().all(|c| c == '}' || c == '{' || c == ' ');
+        if keep {
+            out.push_str(l);
+        }
+    }
+    (out, n)
+}
+
+fn drop_ops() -> &'static Vec<String> {
+    static S: OnceLock<Vec<String>> = OnceLock::new();
+    S.get_or_init(|| std::env::var("TOMBOX_XS_DROP_OPS").unwrap_or_else(|_| "image_,buffer_,tbuffer_".into()).split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+}

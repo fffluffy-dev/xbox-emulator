@@ -182,13 +182,56 @@ fn fed() -> Option<[u8; 64]> {
     None
 }
 
-#[cfg(test)]
+thread_local! {
+    static AT: core::cell::Cell<usize> = const { core::cell::Cell::new(9) };
+    static TOLERATE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static BLOCK_UNDEF: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static UNMODELED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static RELAY2_HOLES: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
 fn site(k: usize) {
+    AT.with(|s| s.set(k));
+    #[cfg(test)]
     SITE.with(|s| s.set(k));
 }
 
-#[cfg(not(test))]
-fn site(_: usize) {}
+fn frame_written(at: usize, ever: &[bool; 64]) -> bool {
+    let q = |m: u8| (0..64).all(|p| ever[p] || m >> (p / 8) & 1 != 0);
+    match at {
+        0 => q(0x88),
+        1 => q(0x80),
+        2 => !RELAY2_HOLES.with(|c| c.get()),
+        _ => false,
+    }
+}
+
+fn undefined_here(holes: bool, tainted: bool, ever: &[bool; 64]) -> Result<(), i32> {
+    if !TOLERATE.with(|c| c.get()) {
+        return Err(E_INVALIDARG);
+    }
+    let at = AT.with(|c| c.get());
+    if holes && !tainted && frame_written(at, ever) {
+        UNMODELED.with(|c| c.set(true));
+        return Err(E_INVALIDARG);
+    }
+    BLOCK_UNDEF.with(|c| c.set(true));
+    Ok(())
+}
+
+pub fn run_block(d: &mut Dcc) -> Result<bool, i32> {
+    TOLERATE.with(|c| c.set(true));
+    BLOCK_UNDEF.with(|c| c.set(false));
+    UNMODELED.with(|c| c.set(false));
+    RELAY2_HOLES.with(|c| c.set(false));
+    let r = run(d);
+    TOLERATE.with(|c| c.set(false));
+    r.map(|()| BLOCK_UNDEF.with(|c| c.get()))
+}
+
+pub fn last_unmodeled() -> bool {
+    UNMODELED.with(|c| c.get())
+}
 
 pub(crate) fn remap(d: &mut Dcc, dst: usize, src: usize, maps: &[Option<(u32, u32)>; 4]) -> Result<(), i32> {
     let meta = d.r32(0x58);
@@ -209,7 +252,7 @@ pub(crate) fn remap(d: &mut Dcc, dst: usize, src: usize, maps: &[Option<(u32, u3
         let Some((from, to)) = maps[k as usize] else {
             let u = undef(d, src, k);
             if u && (dst != 2 || differ(meta, k * 64)?) {
-                return Err(E_INVALIDARG);
+                undefined_here(false, true, &[true; 64])?;
             }
             d.b[dst][o..o + 64].copy_from_slice(&s[o..o + 64]);
             mark(d, dst, k, u);
@@ -223,8 +266,11 @@ pub(crate) fn remap(d: &mut Dcc, dst: usize, src: usize, maps: &[Option<(u32, u3
         }
         let holes = ever.iter().any(|&x| !x);
         let tainted = undef(d, src, k);
+        if holes && AT.with(|c| c.get()) == 1 && !frame_written(1, &ever) {
+            RELAY2_HOLES.with(|c| c.set(true));
+        }
         if (holes || tainted) && (dst != 2 || differ(meta, k * 64)?) {
-            return Err(E_INVALIDARG);
+            undefined_here(holes, tainted, &ever)?;
         }
         d.b[dst][o..o + 64].copy_from_slice(&tmp);
         mark(d, dst, k, holes || tainted);
@@ -1284,7 +1330,7 @@ pub fn run(d: &mut Dcc) -> Result<(), i32> {
     }
     stages(d)?;
     if d.r8(UNDEF0) & 0xf != 0 {
-        return Err(E_INVALIDARG);
+        undefined_here(false, true, &[true; 64])?;
     }
     Ok(())
 }

@@ -407,6 +407,12 @@ pub(crate) fn clone_state(from: *mut c_void, to: *mut c_void) {
     }
 }
 
+pub fn raster_snapshot(list: usize) -> Option<(Vec<u8>, Vec<u8>, Option<u32>, Option<usize>)> {
+    let g = STATES[shard_of(list)].lock().unwrap_or_else(|e| e.into_inner());
+    let s = g.as_ref()?.get(&list)?;
+    Some((s.viewports.clone().unwrap_or_default(), s.scissors.clone().unwrap_or_default(), s.stencil, s.pso))
+}
+
 fn rec<R>(list: *mut c_void, f: impl FnOnce(&mut ListState) -> R) -> R {
     with(list, |s| {
         s.open = true;
@@ -1525,6 +1531,10 @@ unsafe fn apply_bindings(list: *mut c_void, s: &ListState) {
     }
 }
 
+pub(crate) fn active_queries(list: *mut c_void) -> usize {
+    with(list, |s| if s.suspended { 0 } else { s.queries.len() })
+}
+
 pub(crate) unsafe fn reapply(list: *mut c_void) {
     let s = with(list, |s| s.clone());
     unsafe {
@@ -1543,7 +1553,7 @@ pub(crate) unsafe fn reapply(list: *mut c_void) {
                 },
             }
         }
-        if let Some(p) = s.pso { w_pso(list, p as *mut c_void); }
+        if let Some(p) = s.pso { w_pso(list, p as *mut c_void); crate::dred_marks::remark(list, p as *mut c_void); }
         if let Some(t) = s.topology { w_topology(list, t); }
         if let Some(v) = &s.viewports { w_viewports(list, (v.len() / 24) as u32, v.as_ptr()); }
         if let Some(v) = &s.scissors { w_scissors(list, (v.len() / 16) as u32, v.as_ptr()); }
@@ -1750,6 +1760,7 @@ pub(crate) unsafe fn reopen(list: *mut c_void) -> bool {
         record("d3d12_xs", "cl2_state", &format!("list split {list:p}: PC Reset FAILED hr={hr:#010x}"));
         return false;
     }
+    crate::dred_marks::begin_recording(list as usize);
     with(list, |s| s.open = true);
     unsafe { reapply(list) };
     true

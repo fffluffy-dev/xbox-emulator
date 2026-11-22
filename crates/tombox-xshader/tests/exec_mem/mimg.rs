@@ -269,7 +269,7 @@ fn image_mimg_query() {
             pos_uv(&mut pre, 6, 7, k, 0.1);
             let full = [fb(lod.clamp(0.0, 3.0)), fb(lod), 0, 0];
             let mut c = case("image_get_lod", op, build(&pre, &op, 4, dmask.count_ones(), false), Env { tex: Some(&IMG_A), samp: Some(sampler(1, 1, 0)), pos: true, ..Default::default() }, pick(full, dmask));
-            c.tol = 1.0e-5;
+            c.tol = if std::env::var_os("TOMBOX_EXEC_HW").is_some() { 1.0 / 256.0 } else { 1.0e-5 };
             cs.push(c);
         }
     }
@@ -360,4 +360,268 @@ fn image_mimg_d16_packs_halves() {
         cs.push(MCase { m: "image_store", op: op.to_vec(), words: build(&pre, &op, 4, 0, true), env: Env { uav: Some(&IMG_U), ..Default::default() }, rt: vec![], uav, tol: 0.0 });
     }
     run_mem_cases("mimg_d16", &cs);
+}
+
+const AT_INIT: [u32; 8] = [5, 0x10, 0x8000_0000, 0xffff_ffff, 0x20, 0, 0x7fff_ffff, 0x1234_5678];
+
+fn tat(_m: u32, _l: u32, x: u32, y: u32) -> [u32; 4] {
+    [if y == 0 { AT_INIT[x as usize] } else { 0x0bad_0000 | (y * 8 + x) }, 0, 0, 0]
+}
+
+const IMG_AT: Img = Img { w: 8, h: 8, layers: 1, array: false, mips: 1, fmt: R32_UINT, texel: tat };
+
+#[test]
+fn image_mimg_atomics() {
+    type At = fn(u32, u32, u32) -> u32;
+    let atoms: [(&'static str, u32, At); 13] = [
+        ("image_atomic_swap", 0x0f, |_, s, _| s),
+        ("image_atomic_cmpswap", 0x10, |m, s, c| if m == c { s } else { m }),
+        ("image_atomic_add", 0x11, |m, s, _| m.wrapping_add(s)),
+        ("image_atomic_sub", 0x12, |m, s, _| m.wrapping_sub(s)),
+        ("image_atomic_smin", 0x14, |m, s, _| (m as i32).min(s as i32) as u32),
+        ("image_atomic_umin", 0x15, |m, s, _| m.min(s)),
+        ("image_atomic_smax", 0x16, |m, s, _| (m as i32).max(s as i32) as u32),
+        ("image_atomic_umax", 0x17, |m, s, _| m.max(s)),
+        ("image_atomic_and", 0x18, |m, s, _| m & s),
+        ("image_atomic_or", 0x19, |m, s, _| m | s),
+        ("image_atomic_xor", 0x1a, |m, s, _| m ^ s),
+        ("image_atomic_inc", 0x1b, |m, s, _| if m >= s { 0 } else { m + 1 }),
+        ("image_atomic_dec", 0x1c, |m, s, _| if m == 0 || m > s { s } else { m - 1 }),
+    ];
+    let mut cs = Vec::new();
+    for (m, opc, f) in atoms {
+        let dmask = if opc == 0x10 { 0x3 } else { 0x1 };
+        for &(x, s, cmp) in &[(0u32, 5u32, 0xffff_fff0u32), (1, 0x10, 0x10), (2, 0x8000_0000, 0x8000_0000), (3, 7, 0xffff_ffff), (4, 0x20, 1), (5, 0, 0), (6, 0xffff_ffff, 0x7fff_ffff), (7, 0x1234_5678, 3)] {
+            let old = AT_INIT[x as usize];
+            let mut pre = Prog::new();
+            pre.vv(1, x).vv(2, 0).vv(4, s).vv(5, cmp);
+            let uav = vec![(0usize, x as usize, f(old, s, cmp)), (0, (x ^ 1) as usize, AT_INIT[(x ^ 1) as usize]), (0, 8 + x as usize, 0x0bad_0008 + x)];
+            for glc in [true, false] {
+                let mut op = mimg(opc, dmask, 1, 1, 4, 16, 0);
+                if glc {
+                    op[0] |= 1 << 13;
+                }
+                let rt = vec![if glc { old } else { s }];
+                cs.push(MCase { m, op: op.to_vec(), words: build(&pre, &op, 4, 1, true), env: Env { uav: Some(&IMG_AT), ..Default::default() }, rt, uav: uav.clone(), tol: 0.0 });
+            }
+        }
+    }
+    run_mem_cases("mimg_atomics", &cs);
+}
+
+fn tu4(_m: u32, _l: u32, x: u32, y: u32) -> [u32; 4] {
+    match (x, y) {
+        (0, 0) => [0x0000_1234, 0x0001_0000, 0xffff_ffff, 0x0000_0000],
+        (2, 5) => [0x0000_ffff, 0x0000_8000, 0x0002_0001, 0x0000_0001],
+        _ => [x * 10000, y * 20000, 0x1_2345, 0xabcd],
+    }
+}
+
+fn ti4(_m: u32, _l: u32, x: u32, y: u32) -> [u32; 4] {
+    let s = |v: i32| v as u32;
+    match (x, y) {
+        (0, 0) => [s(100), s(-100), s(50_000), s(-50_000)],
+        (2, 5) => [s(32_767), s(-32_768), s(32_768), s(-32_769)],
+        _ => [s(0), s(-1), s(i32::MAX), s(i32::MIN)],
+    }
+}
+
+const IMG_UINT4: Img = Img { w: 8, h: 8, layers: 1, array: false, mips: 1, fmt: R32G32B32A32_UINT, texel: tu4 };
+const IMG_SINT4: Img = Img { w: 8, h: 8, layers: 1, array: false, mips: 1, fmt: R32G32B32A32_SINT, texel: ti4 };
+const IMG_UINT4_U: Img = Img { w: 8, h: 8, layers: 1, array: false, mips: 1, fmt: R32G32B32A32_UINT, texel: tzero };
+const IMG_SINT4_U: Img = Img { w: 8, h: 8, layers: 1, array: false, mips: 1, fmt: R32G32B32A32_SINT, texel: tzero };
+
+fn pack_u16_sat(vals: &[u32]) -> Vec<u32> {
+    let s = |x: u32| x.min(0xffff);
+    vals.chunks(2).map(|p| s(p[0]) | p.get(1).map_or(0, |&v| s(v) << 16)).collect()
+}
+
+fn pack_i16_sat(vals: &[u32]) -> Vec<u32> {
+    let s = |x: u32| ((x as i32).clamp(-32768, 32767) as u32) & 0xffff;
+    vals.chunks(2).map(|p| s(p[0]) | p.get(1).map_or(0, |&v| s(v) << 16)).collect()
+}
+
+#[test]
+fn image_mimg_d16_integer_images() {
+    let mut cs = Vec::new();
+    for &(x, y) in &[(0u32, 0u32), (2, 5), (3, 1)] {
+        for &dmask in &[0xfu32, 0x7, 0x5, 0x3, 0x1, 0x9, 0xa] {
+            let op = d16(mimg(0x00, dmask, 1, 1, 4, 0, 12));
+            let n = dmask.count_ones().div_ceil(2);
+            let mut p = Prog::new();
+            p.raw(&smem(3, 0, P_SRV, 0, SNULL))
+                .vv(1, x)
+                .vv(2, y)
+                .raw(&op)
+                .raw(&[vop2(0x14, 10, v(4), 4)]);
+            for k in 0..n {
+                p.raw(&[vop1(1, k, v(4 + k))]);
+            }
+            cs.push(case(
+                "image_load",
+                op,
+                p.words(),
+                Env { tex: Some(&IMG_UINT4), ..Default::default() },
+                pack_u16_sat(&pick(tu4(0, 0, x, y), dmask)),
+            ));
+
+            let mut p = Prog::new();
+            p.raw(&smem(3, 0, P_SRV, 0, SNULL))
+                .vv(1, x)
+                .vv(2, y)
+                .raw(&op)
+                .raw(&[vop2(0x12, 10, v(4), 4)]);
+            for k in 0..n {
+                p.raw(&[vop1(1, k, v(4 + k))]);
+            }
+            cs.push(case(
+                "image_load",
+                op,
+                p.words(),
+                Env { tex: Some(&IMG_SINT4), ..Default::default() },
+                pack_i16_sat(&pick(ti4(0, 0, x, y), dmask)),
+            ));
+        }
+    }
+
+    let halves: [u16; 4] = [0x7fff, 0x8000, 0xff9c, 0xffff];
+    for &dmask in &[0xfu32, 0x7, 0x5, 0x3, 0x1, 0x9, 0xa] {
+        let (x, y) = (2u32, 3u32);
+        let op = d16(mimg(0x08, dmask, 1, 1, 4, 16, 0));
+        let on: Vec<u16> = (0..4).filter(|c| (dmask >> c) & 1 != 0).map(|c| halves[c]).collect();
+        let regs: Vec<u32> = on.chunks(2).map(|p| (p[0] as u32) | p.get(1).map_or(0, |&v| (v as u32) << 16)).collect();
+        let base = ((y * 8 + x) * 4) as usize;
+
+        for (signed, img, tag_op) in [(false, &IMG_UINT4_U, 0x14u32), (true, &IMG_SINT4_U, 0x12u32)] {
+            let mut pre = Prog::new();
+            pre.vv(1, x).vv(2, y);
+            for (k, r) in regs.iter().enumerate() {
+                pre.vv(4 + k as u32, *r);
+            }
+            pre.raw(&[vop2(tag_op, 4, v(4), 4)]);
+            let mut k = 0usize;
+            let uav = (0..4)
+                .map(|c| {
+                    let w = if (dmask >> c) & 1 != 0 {
+                        let h = on[k];
+                        k += 1;
+                        if signed { (h as i16 as i32) as u32 } else { h as u32 }
+                    } else {
+                        0
+                    };
+                    (0usize, base + c, w)
+                })
+                .collect();
+            cs.push(MCase {
+                m: "image_store",
+                op: op.to_vec(),
+                words: build(&pre, &op, 4, 0, true),
+                env: Env { uav: Some(img), ..Default::default() },
+                rt: vec![],
+                uav,
+                tol: 0.0,
+            });
+        }
+    }
+    run_mem_cases("mimg_d16_int", &cs);
+}
+
+fn unorm(op: [u32; 2]) -> [u32; 2] {
+    [op[0] | (1 << 12), op[1]]
+}
+
+fn a16(op: [u32; 2]) -> [u32; 2] {
+    [op[0], op[1] | (1 << 30)]
+}
+
+#[test]
+fn image_mimg_unorm_a16_and_refusals() {
+    let mut cs = Vec::new();
+    let tex_a = || Env { tex: Some(&IMG_A), samp: ptsamp(), ..Default::default() };
+    let tex_c = || Env { tex: Some(&IMG_C), samp: ptsamp(), ..Default::default() };
+
+    for &(tx, ty) in &[(0.5f32, 0.5f32), (2.5, 4.5), (7.5, 1.5)] {
+        let op = unorm(mimg(0x27, 0xf, 1, 1, 4, 0, 12));
+        let mut pre = Prog::new();
+        pre.vv(1, fb(tx)).vv(2, fb(ty));
+        let (x, y) = (tx.floor() as u32, ty.floor() as u32);
+        cs.push(case("image_sample_lz", op, build(&pre, &op, 4, 4, false), tex_a(), ea(0, x, y).to_vec()));
+    }
+    for &(tx, ty, slice) in &[(1.5f32, 2.5f32, 0.0f32), (3.5, 6.5, 2.0)] {
+        let op = unorm(mimg(0x27, 0xf, 5, 1, 4, 0, 12));
+        let mut pre = Prog::new();
+        pre.vv(1, fb(tx)).vv(2, fb(ty)).vv(3, fb(slice));
+        let (x, y) = (tx.floor() as u32, ty.floor() as u32);
+        cs.push(case("image_sample_lz", op, build(&pre, &op, 4, 4, false), tex_c(), ta(0, slice as u32, x, y).to_vec()));
+    }
+    for &(tx, ty, lod) in &[(2.5f32, 4.5f32, 1.0f32), (6.5, 2.5, 2.0)] {
+        let op = unorm(mimg(0x24, 0xf, 1, 1, 4, 0, 12));
+        let mut pre = Prog::new();
+        pre.vv(1, fb(tx)).vv(2, fb(ty)).vv(3, fb(lod));
+        let m = nearest(lod, 4);
+        let (x, y) = pt(m, tx / 8.0, ty / 8.0, (0, 0));
+        cs.push(case("image_sample_l", op, build(&pre, &op, 4, 4, false), tex_a(), ea(m, x, y).to_vec()));
+    }
+
+    for &(x, y) in &[(2u32, 5u32), (7, 3), (0, 0)] {
+        let op = a16(mimg(0x00, 0xf, 1, 1, 4, 0, 12));
+        let mut pre = Prog::new();
+        pre.vv(1, x | (y << 16));
+        cs.push(case("image_load", op, build(&pre, &op, 4, 4, false), tex_a(), ea(0, x, y).to_vec()));
+    }
+    {
+        let (x, y) = (4u32, 6u32);
+        let op = a16(mimg(0x08, 0xf, 1, 1, 4, 16, 0));
+        let vals = [fb(1.25), fb(-3.5), fb(42.0), fb(0.5)];
+        let mut pre = Prog::new();
+        pre.vv(1, x | (y << 16)).vv(4, vals[0]).vv(5, vals[1]).vv(6, vals[2]).vv(7, vals[3]);
+        let base = ((y * 8 + x) * 4) as usize;
+        let uav = (0..4).map(|c| (0usize, base + c, vals[c])).collect();
+        cs.push(MCase { m: "image_store", op: op.to_vec(), words: build(&pre, &op, 4, 0, true), env: Env { uav: Some(&IMG_U), ..Default::default() }, rt: vec![], uav, tol: 0.0 });
+    }
+    for &(u, v) in &[(0.3125f32, 0.5625f32), (0.8125, 0.1875)] {
+        let op = a16(mimg(0x27, 0xf, 1, 1, 4, 0, 12));
+        let mut pre = Prog::new();
+        pre.vv(1, h16(u) | (h16(v) << 16));
+        let (x, y) = pt(0, u, v, (0, 0));
+        cs.push(case("image_sample_lz", op, build(&pre, &op, 4, 4, false), tex_a(), ea(0, x, y).to_vec()));
+    }
+    {
+        let (u, v, lod) = (0.3125f32, 0.5625f32, 2.0f32);
+        let op = a16(mimg(0x24, 0xf, 1, 1, 4, 0, 12));
+        let mut pre = Prog::new();
+        pre.vv(1, h16(u) | (h16(v) << 16)).vv(2, h16(lod));
+        let m = nearest(lod, 4);
+        let (x, y) = pt(m, u, v, (0, 0));
+        cs.push(case("image_sample_l", op, build(&pre, &op, 4, 4, false), tex_a(), ea(m, x, y).to_vec()));
+    }
+    run_mem_cases("mimg_unorm_a16", &cs);
+
+    let mimg_base = mimg(0x27, 0xf, 1, 1, 4, 0, 12);
+    for (bad_op, needle) in [
+        ([mimg_base[0] | (1 << 16), mimg_base[1]], "TFE"),
+        ([mimg_base[0] | (1 << 17), mimg_base[1]], "LWE"),
+        (unorm(mimg(0x27, 0xf, 3, 1, 4, 0, 12)), "cube"),
+    ] {
+        let mut pre = Prog::new();
+        pre.vv(1, fb(0.5)).vv(2, fb(0.5)).vv(3, fb(0.0));
+        let words = build(&pre, &bad_op, 4, 4, false);
+        let err = match translate(&extract(&words, false)) {
+            Ok(t) => panic!("expected refusal for {needle}, got:\n{}", t.hlsl),
+            Err(e) => e,
+        };
+        assert!(err.contains(needle), "expected {needle} in error: {err}");
+    }
+    for (bad_mubuf, needle) in [
+        ([0xe000_0000 | (0x0c << 18) | (1 << 16), 0x0002_0401], "MUBUF LDS"),
+        ([0xe000_0000 | (0x0c << 18), 0x0082_0401], "MUBUF TFE"),
+    ] {
+        let mut p = Prog::new();
+        p.raw(&smem(2, 8, P_SRV, 0, SNULL)).vv(1, 0).raw(&bad_mubuf).raw(&[vop1(1, 0, v(4))]);
+        let err = match translate(&extract(&p.words(), false)) {
+            Ok(t) => panic!("expected refusal for {needle}, got:\n{}", t.hlsl),
+            Err(e) => e,
+        };
+        assert!(err.contains(needle), "expected {needle} in error: {err}");
+    }
 }

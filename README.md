@@ -92,4 +92,4 @@ The full plan, with what blocks each step, is in **[docs/ROADMAP.md](docs/ROADMA
 
 ## Credit
 
-[drycheetah84/TomBox](https://github.com/drycheetah84/TomBox) (base commit `7e8064f`) and [omonkeyz/xbox-emulator](https://github.com/omonkeyz/xbox-emulator) for the runtime; [ItsNotRexed/Leonida](https://github.com/ItsNotRexed/Leonida) for the GTA VI resource model ported into the translator. The progress map keeps TomBox's metric definitions so its numbers stay comparable.
+[drycheetah84/TomBox](https://github.com/drycheetah84/TomBox) (base commit `7e8064f`) and [omonkeyz/xbox-emulator](https://github.com/omonkeyz/xbox-emulator) for the runtime (synced with its `main` at `1e77fcc`, 2026-11-22, including its contributors' work up to PR #169); [ItsNotRexed/Leonida](https://github.com/ItsNotRexed/Leonida) for the GTA VI resource model ported into the translator. The progress map keeps TomBox's metric definitions so its numbers stay comparable.

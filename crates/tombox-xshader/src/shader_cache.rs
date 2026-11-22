@@ -240,12 +240,14 @@ pub struct Stats {
     pub writes: u64,
 }
 
+pub static COMPILE_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 static BAD: AtomicU64 = AtomicU64::new(0);
 static WRITES: AtomicU64 = AtomicU64::new(0);
 static TRUNC: AtomicU64 = AtomicU64::new(0);
 
+#[allow(dead_code)]
 struct Lock<'a>(&'a File, [usize; 4], std::sync::MutexGuard<'a, ()>);
 
 impl<'a> Lock<'a> {
@@ -422,6 +424,13 @@ pub struct Compiled {
 }
 
 pub fn compile_cached(final_hlsl: &str, profile: &str, fma: Fma, extra: &[&str]) -> Result<Compiled, String> {
+    compile_cached_with(final_hlsl, profile, fma, extra, || crate::dxc::compile_fma(final_hlsl, profile, fma, extra))
+}
+
+pub fn compile_cached_with(
+    final_hlsl: &str, profile: &str, fma: Fma, extra: &[&str],
+    compile: impl FnOnce() -> Result<Vec<u8>, String>,
+) -> Result<Compiled, String> {
     let t0 = std::time::Instant::now();
     let k = key(final_hlsl, profile, fma, &extra.join(" "));
     if let Some(code) = get(k) {
@@ -429,8 +438,14 @@ pub fn compile_cached(final_hlsl: &str, profile: &str, fma: Fma, extra: &[&str])
     }
     let lookup_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let t1 = std::time::Instant::now();
-    let code = crate::dxc::compile_fma(final_hlsl, profile, fma, extra)?;
+    let code = compile();
     let dxc_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    let hook = COMPILE_HOOK.load(Ordering::Relaxed);
+    if hook != 0 {
+        let f: fn(u64) = unsafe { core::mem::transmute(hook) };
+        f((dxc_ms * 1000.0) as u64);
+    }
+    let code = code?;
     let _ = put(k, &code);
     Ok(Compiled { code, source: Source::Compiled, dxc_ms, lookup_ms })
 }

@@ -22,8 +22,6 @@
 //!   * the PC texture is assumed to be in its creation state when the upload list runs
 //!     (the title's own barriers are not tracked);
 //!   * memory that is not committed/readable is skipped and retried later;
-//!   * a write racing the read is repaired on a later frame (hash changes again), but a
-//!     decommit racing the read would fault;
 //!   * Texture3D, multi-plane and render-target/depth placed textures are not mirrored.
 
 use core::ffi::c_void;
@@ -163,6 +161,83 @@ fn scan_subs(t: &Tracked, subs: &[usize]) -> Option<Scan> {
 fn sparse_zero_enabled() -> bool {
     static SW: crate::live_sw::Sw = crate::live_sw::Sw::new("TOMBOX_SPARSE_ZERO", "sparse_zero", true);
     SW.on()
+}
+
+struct HashJob {
+    addr: usize,
+    len: usize,
+    zero_test: bool,
+    hash: u64,
+    all_zero: bool,
+}
+
+struct NonzeroJob {
+    addr: usize,
+    len: usize,
+    found: bool,
+}
+
+struct CopyJob {
+    src: usize,
+    dst: usize,
+    len: usize,
+}
+
+struct DetileJob {
+    dst0: usize,
+    pitch: usize,
+    src0: usize,
+    offs: *const u32,
+    offs_len: usize,
+    w_e: usize,
+    y0: usize,
+    y1: usize,
+    bpe: usize,
+}
+
+const _: () = assert!(!core::mem::needs_drop::<HashJob>());
+const _: () = assert!(!core::mem::needs_drop::<NonzeroJob>());
+const _: () = assert!(!core::mem::needs_drop::<CopyJob>());
+const _: () = assert!(!core::mem::needs_drop::<DetileJob>());
+
+unsafe extern "C" fn hash_job(ctx: *mut c_void) {
+    let j = &mut *(ctx as *mut HashJob);
+    let s = core::slice::from_raw_parts(j.addr as *const u8, j.len);
+    j.hash = hash_bytes(s);
+    j.all_zero = j.zero_test && s.iter().all(|&b| b == 0);
+}
+
+unsafe extern "C" fn nonzero_job(ctx: *mut c_void) {
+    let j = &mut *(ctx as *mut NonzeroJob);
+    j.found = core::slice::from_raw_parts(j.addr as *const u8, j.len).iter().any(|&x| x != 0);
+}
+
+unsafe extern "C" fn copy_job(ctx: *mut c_void) {
+    let j = &*(ctx as *const CopyJob);
+    core::ptr::copy_nonoverlapping(j.src as *const u8, j.dst as *mut u8, j.len);
+}
+
+unsafe extern "C" fn detile_job(ctx: *mut c_void) {
+    let j = &*(ctx as *const DetileJob);
+    detile_span(j.dst0, j.pitch, j.src0, core::slice::from_raw_parts(j.offs, j.offs_len), j.w_e, j.y0..j.y1, j.bpe);
+}
+
+#[track_caller]
+fn hash_title(addr: usize, len: usize, zero_test: bool) -> Option<(u64, bool)> {
+    let mut j = HashJob { addr, len, zero_test, hash: 0, all_zero: false };
+    crate::guard::guarded(addr, len, hash_job, &mut j as *mut HashJob as *mut c_void).then_some((j.hash, j.all_zero))
+}
+
+#[track_caller]
+fn nonzero_title(addr: usize, len: usize) -> Option<bool> {
+    let mut j = NonzeroJob { addr, len, found: false };
+    crate::guard::guarded(addr, len, nonzero_job, &mut j as *mut NonzeroJob as *mut c_void).then_some(j.found)
+}
+
+#[track_caller]
+fn copy_title(src: usize, dst: usize, len: usize) -> bool {
+    let j = CopyJob { src, dst, len };
+    crate::guard::guarded(src, len, copy_job, &j as *const CopyJob as *mut c_void)
 }
 
 fn hash_bytes(b: &[u8]) -> u64 {
@@ -592,7 +667,9 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
             }
             let mut v = vec![0u8; len];
             for (a, b) in &sc.ok {
-                core::ptr::copy_nonoverlapping(*a as *const u8, v.as_mut_ptr().add(a - lo), b - a);
+                let dst = v.as_mut_ptr().add(a - lo) as usize;
+                let (src, n) = (*a, b - a);
+                let _ = copy_title(src, dst, n);
             }
             snap = Some(Arc::new(v));
             t.partial[sub as usize] = mark;
@@ -604,10 +681,14 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
             None => core::slice::from_raw_parts(lo as *const u8, len),
         };
         let ck = std::time::Instant::now();
-        let h = hash_bytes(mem);
+        let need_zero_test = t.hashes[sub as usize].is_none() && !gpu_owned;
+        let Some((h, all_zero)) = hash_title(mem.as_ptr() as usize, mem.len(), need_zero_test) else {
+            unreadable += 1;
+            continue;
+        };
         stage_time(2, ck);
         *hashed += mem.len() as u64;
-        if t.hashes[sub as usize].is_none() && (gpu_owned || mem.iter().all(|&b| b == 0)) {
+        if t.hashes[sub as usize].is_none() && (gpu_owned || all_zero) {
             // Never written by the title (fresh committed pages are zero). Do not upload:
             // the title may instead fill this subresource with a GPU copy
             // (CopyTextureRegion), which an upload of zeros could overwrite.
@@ -666,7 +747,10 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
         let dst0 = data.add(fp.offset() as usize);
         let pitch = fp.row_pitch() as usize;
         let src0 = match &snap { Some(v) => v.as_ptr().wrapping_sub(map.lo), None => base };
-        detile_rows(dst0, pitch, src0, &map.offs, map.w_e as usize, map.h_e as usize, bpe);
+        if !detile_rows(dst0, pitch, src0, (src0 as usize).wrapping_add(map.lo), map.hi - map.lo, &map.offs, map.w_e as usize, map.h_e as usize, bpe) {
+            up.unreadable += 1;
+            continue;
+        }
         t.hashes[sub as usize] = Some(h);
         t.watch[sub as usize] = now + WATCH_PUMPS;
         t.hot = t.hot.max(now + WATCH_PUMPS);
@@ -725,31 +809,50 @@ unsafe fn detile_span(dst0: usize, pitch: usize, src0: usize, offs: &[u32], w_e:
     }
 }
 
-unsafe fn detile_rows(dst0: *mut u8, pitch: usize, src0: *const u8, offs: &[u32], w_e: usize, h_e: usize, bpe: usize) {
-    let (d, s) = (dst0 as usize, src0 as usize);
+#[track_caller]
+fn detile_guarded(title_lo: usize, title_len: usize, job: &DetileJob) -> bool {
+    crate::guard::guarded(title_lo, title_len, detile_job, job as *const DetileJob as *mut c_void)
+}
+
+unsafe fn detile_rows(dst0: *mut u8, pitch: usize, src0: *const u8, title_lo: usize, title_len: usize, offs: &[u32], w_e: usize, h_e: usize, bpe: usize) -> bool {
+    let job = |y0: usize, y1: usize| DetileJob { dst0: dst0 as usize, pitch, src0: src0 as usize, offs: offs.as_ptr(), offs_len: offs.len(), w_e, y0, y1, bpe };
     let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 8);
     if w_e * h_e * bpe < PARALLEL_DETILE_BYTES || workers == 1 || h_e < 2 {
-        detile_span(d, pitch, s, offs, w_e, 0..h_e, bpe);
-        return;
+        return detile_guarded(title_lo, title_len, &job(0, h_e));
     }
     let chunk = h_e.div_ceil(workers);
+    let faulted = core::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|sc| {
         for k in 1..workers {
-            let r = (k * chunk).min(h_e)..((k + 1) * chunk).min(h_e);
-            if !r.is_empty() {
-                sc.spawn(move || unsafe { detile_span(d, pitch, s, offs, w_e, r, bpe) });
+            let (y0, y1) = ((k * chunk).min(h_e), ((k + 1) * chunk).min(h_e));
+            if y0 < y1 {
+                let (faulted, job) = (&faulted, job(y0, y1));
+                let job = SendJob(job);
+                sc.spawn(move || {
+                    let job = job;
+                    if !detile_guarded(title_lo, title_len, &job.0) {
+                        faulted.store(true, core::sync::atomic::Ordering::Relaxed);
+                    }
+                });
             }
         }
-        detile_span(d, pitch, s, offs, w_e, 0..chunk.min(h_e), bpe);
+        if !detile_guarded(title_lo, title_len, &job(0, chunk.min(h_e))) {
+            faulted.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
     });
+    !faulted.load(core::sync::atomic::Ordering::Relaxed)
 }
+
+struct SendJob(DetileJob);
+
+unsafe impl Send for SendJob {}
 
 fn barrier(res: usize, before: u32, after: u32) -> [u64; 4] {
     [0, res as u64, 0xffff_ffffu64 | ((before as u64) << 32), after as u64]
 }
 
 fn first_nonzero(ranges: &[(usize, usize)]) -> bool {
-    ranges.iter().any(|&(a, b)| unsafe { core::slice::from_raw_parts(a as *const u8, b - a) }.iter().any(|&x| x != 0))
+    ranges.iter().any(|&(a, b)| nonzero_title(a, b - a).unwrap_or(true))
 }
 
 fn watch_pending(up: &mut Uploader) -> (u64, u64) {
@@ -782,7 +885,7 @@ fn watch_pending(up: &mut Uploader) -> (u64, u64) {
                 }
             } else if sc.bad.is_none() {
                 scanned += n as u64;
-                let h = hash_bytes(unsafe { core::slice::from_raw_parts(a as *const u8, n) });
+                let Some((h, _)) = hash_title(a, n, false) else { continue };
                 if t.hashes[sub] != Some(h) {
                     t.hashes[sub] = None;
                     changed += 1;
@@ -824,6 +927,29 @@ impl PumpPhases {
             total as f64 / 1000.0, parts.join(" "), bytes >> 20, st[0] as f64 / 1000.0, st[1] as f64 / 1000.0, st[2] as f64 / 1000.0, st[3] as f64 / 1000.0, st[5] >> 20, st[4] as f64 / 1000.0,
             if note.is_empty() { String::new() } else { format!(" ({note})") }));
     }
+}
+
+static DIRECT_QUEUES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+pub fn register_direct_queue(queue: *mut c_void) {
+    if !queue.is_null() {
+        let mut g = DIRECT_QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+        let addr = queue as usize;
+        if !g.contains(&addr) {
+            g.push(addr);
+        }
+    }
+}
+
+pub fn is_direct_queue(queue: *mut c_void) -> bool {
+    if queue.is_null() {
+        return false;
+    }
+    DIRECT_QUEUES.lock().unwrap_or_else(|e| e.into_inner()).contains(&(queue as usize))
+}
+
+pub fn direct_queue() -> Option<*mut c_void> {
+    DIRECT_QUEUES.lock().unwrap_or_else(|e| e.into_inner()).first().copied().map(|q| q as *mut c_void)
 }
 
 /// Called once per `PresentX`, on the presenting thread, before the frame is copied out.
@@ -1098,6 +1224,63 @@ mod zero_watch_tests {
     }
 
     #[test]
+    fn decommitted_memory_skips_the_read_instead_of_faulting() {
+        extern "system" {
+            fn VirtualAlloc(addr: *mut c_void, len: usize, ty: u32, protect: u32) -> *mut c_void;
+            fn VirtualFree(addr: *mut c_void, len: usize, ty: u32) -> i32;
+        }
+        const PAGE: usize = 4096;
+        unsafe {
+            let base = VirtualAlloc(core::ptr::null_mut(), 3 * PAGE, 0x3000, 0x04) as usize;
+            assert_ne!(base, 0);
+            core::ptr::write_bytes(base as *mut u8, 0xab, 3 * PAGE);
+            assert!(hash_title(base, 3 * PAGE, true).is_some());
+            assert!(first_nonzero(&[(base, base + 3 * PAGE)]));
+            assert_eq!(VirtualFree((base + PAGE) as *mut c_void, PAGE, 0x4000), 1);
+            assert!(hash_title(base, 3 * PAGE, true).is_none());
+            assert!(hash_title(base + PAGE, PAGE, false).is_none());
+            assert!(hash_title(base, PAGE, false).is_some());
+            assert!(hash_title(base + 2 * PAGE, PAGE, false).is_some());
+            assert!(first_nonzero(&[(base + PAGE, base + 2 * PAGE)]));
+            let mut copy = vec![0u8; 3 * PAGE];
+            assert!(copy_title(base, copy.as_mut_ptr() as usize, PAGE));
+            assert!(!copy_title(base + PAGE, copy.as_mut_ptr() as usize, PAGE));
+            let (w, h, bpe) = (32usize, 128usize, 4usize);
+            let offs: Vec<u32> = (0..w * h).map(|i| ((i % (3 * PAGE / bpe)) * bpe) as u32).collect();
+            let mut dst = vec![0u8; w * h * bpe];
+            assert!(!detile_rows(dst.as_mut_ptr(), w * bpe, base as *const u8, base, 3 * PAGE, &offs, w, h, bpe));
+            VirtualFree(base as *mut c_void, 0, 0x8000);
+        }
+    }
+
+    #[test]
+    fn guarded_reads_cost_one_call_per_range_not_per_byte() {
+        for &len in &[16usize << 10, 256 << 10, 4 << 20] {
+            let buf: Vec<u8> = (0..len).map(|i| (i * 31 + i / 7) as u8).collect();
+            let addr = buf.as_ptr() as usize;
+            let iters = ((64usize << 20) / len).max(4);
+            let time = |guarded: bool| {
+                let t = std::time::Instant::now();
+                let mut acc = 0u64;
+                for _ in 0..iters {
+                    acc ^= if guarded {
+                        hash_title(addr, len, false).unwrap().0
+                    } else {
+                        hash_bytes(unsafe { core::slice::from_raw_parts(addr as *const u8, len) })
+                    };
+                }
+                std::hint::black_box(acc);
+                t.elapsed().as_nanos() as f64 / iters as f64
+            };
+            time(false);
+            time(true);
+            let (direct, guarded) = (time(false), time(true));
+            eprintln!("hash of {:>5} KiB: unguarded {direct:>10.0} ns/call, guarded {guarded:>10.0} ns/call ({:+.1}%)", len >> 10, (guarded / direct - 1.0) * 100.0);
+            assert_eq!(hash_title(addr, len, true), Some((hash_bytes(&buf), buf.iter().all(|&b| b == 0))));
+        }
+    }
+
+    #[test]
     fn notes_find_only_overlapping_textures() {
         let index = vec![(0x1000, 0x2000, 7), (0x2000, 0x3000, 8), (0x8000, 0x9000, 9)];
         assert_eq!(overlapping(&index, 0x1800, 0x1900), vec![7]);
@@ -1116,7 +1299,7 @@ mod zero_watch_tests {
         let mut a = vec![0u8; pitch * h];
         let mut b = vec![0u8; pitch * h];
         unsafe {
-            detile_rows(a.as_mut_ptr(), pitch, src.as_ptr(), &offs, w, h, bpe);
+            assert!(detile_rows(a.as_mut_ptr(), pitch, src.as_ptr(), src.as_ptr() as usize, src.len(), &offs, w, h, bpe));
             detile_span(b.as_mut_ptr() as usize, pitch, src.as_ptr() as usize, &offs, w, 0..h, bpe);
         }
         assert!(w * h * bpe >= PARALLEL_DETILE_BYTES);
@@ -1179,5 +1362,20 @@ mod detile_speed_tests {
         let per = t.elapsed().as_secs_f64() * 100.0;
         eprintln!("single-thread detile of 1 MB: {per:.2} ms");
         assert!(per < 20.0, "{per} ms");
+    }
+}
+
+#[cfg(test)]
+mod direct_queue_and_pending_tests {
+    use super::*;
+
+    #[test]
+    fn direct_queue_registration_and_detection() {
+        let fake_q = 0xdead_beefusize as *mut c_void;
+        assert!(!is_direct_queue(fake_q));
+        register_direct_queue(fake_q);
+        assert!(is_direct_queue(fake_q));
+        assert!(!is_direct_queue((fake_q as usize + 8) as *mut c_void));
+        assert!(direct_queue().is_some());
     }
 }

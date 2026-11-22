@@ -5,7 +5,7 @@
 //! wrapped in a `ShaderExtract` with a made-up signature.
 
 use tombox_xshader::hlsl::translate;
-use tombox_xshader::meta::{GsInfo, MeshInfo, RootParam, RootParamKind, RootRange, RootSig, SigElement};
+use tombox_xshader::meta::{GsInfo, MeshInfo, PsvResource, RootParam, RootParamKind, RootRange, RootSig, SigElement};
 use tombox_xshader::{parse_root_signature, ShaderExtract, Stage};
 
 const S_ENDPGM: u32 = 0xbf81_0000;
@@ -39,6 +39,7 @@ fn shader(stage: Stage, words: &[u32], input_sig: Vec<SigElement>, output_sig: V
         isa,
         isa_offset_in_fssm: 0,
         isa_preamble: [0; 4],
+        psv_numthreads: None,
         has_input_sig: true,
         has_output_sig: true,
         has_psv0: false,
@@ -332,6 +333,44 @@ fn loops_translate_deterministically() {
 }
 
 #[test]
+fn vertex_fetch_packs_read_attributes_into_consecutive_vgprs() {
+    let words = [
+        0xbe84_2104,
+        0xf800_00cf, 0x0706_0504,
+        0xf800_0a0f, 0x0b0a_0908,
+        S_ENDPGM,
+    ];
+    let mut position = sig("POSITION", 0, 3, 0, 0x3);
+    position.rw_mask = 0x3;
+    let unused = sig("NORMAL", 0, 3, 1, 0xf);
+    let mut attribute = sig("TEXCOORD", 0, 1, 3, 0x4);
+    attribute.rw_mask = 0x4;
+    let ex = shader(
+        Stage::Vertex,
+        &words,
+        vec![position, unused, attribute],
+        vec![sig("SV_Position", 1, 3, 0, 0xf), sig("TEXCOORD", 0, 1, 1, 0xf)],
+        None,
+    );
+    let t = translate(&ex).expect("vertex fetch translates");
+    for assignment in [
+        "v4 = asuint(i.i0.x);",
+        "v5 = asuint(i.i0.y);",
+        "v6 = 0u;",
+        "v7 = 0x3f800000u;",
+        "v8 = 0u;",
+        "v9 = 0u;",
+        "v10 = (uint)(i.i2.x);",
+        "v11 = 0x3f800000u;",
+    ] {
+        assert!(t.hlsl.contains(assignment), "missing {assignment}\n{}", t.hlsl);
+    }
+    assert!(!t.hlsl.contains("i.i1."), "{}", t.hlsl);
+    #[cfg(windows)]
+    tombox_xshader::dxc::compile(&t.hlsl, &tombox_xshader::dxc::profile_for(t.profile)).unwrap();
+}
+
+#[test]
 fn vertex_misc_vector_export_feeds_the_render_target_array_index() {
     let words = [0xf800_00cf, 0x0403_0200, 0xf800_08df, 0x0200_0101, S_ENDPGM];
     let ex = shader(
@@ -344,6 +383,72 @@ fn vertex_misc_vector_export_feeds_the_render_target_array_index() {
     let t = translate(&ex).expect("POS1 misc vector export translates");
     let line = t.hlsl.lines().find(|l| l.contains("o.o1 =")).unwrap_or_else(|| panic!("no layer write:\n{}", t.hlsl));
     assert!(line.contains("uint4(") && line.trim_end().ends_with(".z);"), "{line}");
+}
+
+#[test]
+fn rdna2_viewport_index_comes_from_layer_bits_19_16() {
+    let words = [0xf800_00cf, 0x0403_0200, 0xf800_08df, 0x0200_0101, S_ENDPGM];
+    let inputs = vec![sig("SV_VertexID", 6, 1, 0, 1)];
+    let ex = shader(
+        Stage::Vertex,
+        &words,
+        inputs.clone(),
+        vec![sig("SV_Position", 1, 3, 0, 0xf), sig("SV_RenderTargetArrayIndex", 4, 1, 1, 1), sig("SV_ViewportArrayIndex", 5, 1, 2, 1)],
+        None,
+    );
+    let t = translate(&ex).expect("viewport export translates");
+    let layer = t.hlsl.lines().find(|l| l.contains("o.o1 =")).unwrap_or_else(|| panic!("no layer write:\n{}", t.hlsl));
+    let view = t.hlsl.lines().find(|l| l.contains("o.o2 =")).unwrap_or_else(|| panic!("no viewport write:\n{}", t.hlsl));
+    assert!(layer.contains("(v0) & 0x7ffu"), "{layer}");
+    assert!(view.contains("((v0) >> 16) & 0xfu"), "{view}");
+    assert!(!view.contains(".w"), "{view}");
+    let view_only = shader(
+        Stage::Vertex,
+        &words,
+        inputs.clone(),
+        vec![sig("SV_Position", 1, 3, 0, 0xf), sig("SV_ViewportArrayIndex", 5, 1, 1, 1)],
+        None,
+    );
+    let only = translate(&view_only).expect("viewport without a layer translates");
+    let line = only.hlsl.lines().find(|l| l.contains("o.o1 =")).unwrap_or_else(|| panic!("no viewport write:\n{}", only.hlsl));
+    assert!(line.contains("((v0) >> 16) & 0xfu"), "{line}");
+    let mut no_z = words;
+    no_z[2] = 0xf800_08db;
+    let e = translate(&shader(
+        Stage::Vertex,
+        &no_z,
+        inputs,
+        vec![sig("SV_Position", 1, 3, 0, 0xf), sig("SV_ViewportArrayIndex", 5, 1, 1, 1)],
+        None,
+    ))
+    .err()
+    .expect("missing z lane translated");
+    assert!(e.contains('z') && e.contains("SV_ViewportArrayIndex"), "{e}");
+    #[cfg(windows)]
+    tombox_xshader::dxc::compile(&t.hlsl, &tombox_xshader::dxc::profile_for(t.profile)).unwrap();
+}
+
+const EXP_POS0_V0_V3: [u32; 2] = [0xf800_08cf, 0x0300_0300];
+
+#[test]
+fn vertex_shader_receives_vertex_and_instance_index_in_v0_and_v3() {
+    let words = [EXP_POS0_V0_V3[0], EXP_POS0_V0_V3[1], S_ENDPGM];
+    let position = || vec![sig("SV_Position", 1, 3, 0, 0xf)];
+    let ex = shader(Stage::Vertex, &words, vec![sig("SV_VertexID", 6, 1, 0, 1), sig("SV_InstanceID", 8, 1, 1, 1)], position(), None);
+    let t = translate(&ex).expect("translate (vertex and instance index)");
+    assert!(t.hlsl.contains("    v0 = (uint)(i.i0);"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("    v3 = (uint)(i.i1);"), "{}", t.hlsl);
+    let ex = shader(Stage::Vertex, &words, vec![sig("SV_VertexID", 6, 1, 0, 1)], position(), None);
+    let t = translate(&ex).expect("translate (vertex index only)");
+    assert!(t.hlsl.contains("    v0 = (uint)(i.i0);"), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("v3 = (uint)(i."), "{}", t.hlsl);
+    let mut attribute = sig("ATTRIBUTE", 0, 3, 0, 0xf);
+    attribute.rw_mask = 0xf;
+    let exp_pos0_v4_v5_v6_v7 = [0xf800_08cf, 0x0706_0504, S_ENDPGM];
+    let ex = shader(Stage::Vertex, &exp_pos0_v4_v5_v6_v7, vec![attribute, sig("SV_VertexID", 6, 1, 1, 1), sig("SV_InstanceID", 8, 1, 2, 1)], position(), None);
+    let t = translate(&ex).expect("translate (index declared, not read)");
+    assert!(!t.hlsl.contains("v0 = (uint)(i.") && !t.hlsl.contains("v3 = (uint)(i."), "{}", t.hlsl);
+    assert!(t.hlsl.contains("    v4 = asuint(i.i0.x);"), "{}", t.hlsl);
 }
 
 #[test]
@@ -488,5 +593,295 @@ fn store_data_registers_count_as_entry_reads() {
         let ex = shader(Stage::Pixel, &words, vec![pos.clone()], vec![], root());
         let t = translate(&ex).unwrap_or_else(|e| panic!("{label}: {e}"));
         assert!(t.hlsl.contains("v2 = asuint(i.i0.x);"), "{label}:\n{}", t.hlsl);
+    }
+}
+
+#[test]
+fn image_ops_with_status_or_r128_bits_are_refused() {
+    let root = || Some(RootSig { version: 2, flags: 1, params: vec![table(0, 64, 5), table(2, 16, 5)], num_static_samplers: 0, static_samplers: Vec::new() });
+    let program = |load: u32| vec![0xf40c_0004, 0xfa00_0000, 0x7e00_0280, 0x7e02_0280, load, 0x0000_0000, 0x3604_0081, S_NOP, S_NOP, PACK_V0_V2_V2, PACK_V1_V2_V2, EXP_MRT0_COMPR[0], EXP_MRT0_COMPR[1], S_ENDPGM];
+    let out = || vec![sig("SV_Target", 64, 3, 0, 0xf)];
+    translate(&shader(Stage::Pixel, &program(0xf000_1108), vec![], out(), root())).expect("plain image_load");
+    for (bit, name) in [(15, "R128"), (17, "LWE")] {
+        let e = translate(&shader(Stage::Pixel, &program(0xf000_1108 | 1 << bit), vec![], out(), root())).err().unwrap_or_else(|| panic!("{name} translated"));
+        assert!(e.contains(name), "{name}: {e}");
+    }
+    // TFE on a load is translated: the status VGPR after the data reads 0 (fully resident).
+    translate(&shader(Stage::Pixel, &program(0xf000_1108 | 1 << 16), vec![], out(), root())).expect("image_load with TFE");
+}
+
+#[test]
+fn durango_vertex_fetch_call_synthesizes_attributes_from_input_signature() {
+    let words = [0xbe80_2100, 0xf800_00cf, 0x0706_0504, S_ENDPGM];
+    let pos_in = sig("POSITION", 0, 3, 0, 0xf);
+    let color_in = sig("COLOR", 0, 3, 1, 0xf);
+    let pos_out = sig("SV_Position", 1, 3, 0, 0xf);
+    let mut ex = shader(Stage::Vertex, &words, vec![pos_in, color_in], vec![pos_out], None);
+
+    let mut durango_blob = vec![0u8; 72];
+    durango_blob[0..8].copy_from_slice(&72u64.to_le_bytes());
+    durango_blob[0x18..0x1c].copy_from_slice(&5u32.to_le_bytes());
+    durango_blob[0x28..0x30].copy_from_slice(&64u64.to_le_bytes());
+    ex.fssm = durango_blob;
+
+    let t = translate(&ex).expect("Durango vertex shader with s_swappc translates");
+    assert!(t.hlsl.contains("struct SIn {"), "Missing SIn:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("float4 i0 : POSITION0;"), "Missing POSITION0:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("float4 i1 : COLOR0;"), "Missing COLOR0:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("v4 = asuint(i.i0.x);"), "Missing v4 init:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("v7 = asuint(i.i0.w);"), "Missing v7 init:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("v8 = asuint(i.i1.x);"), "Missing v8 init:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("v11 = asuint(i.i1.w);"), "Missing v11 init:\n{}", t.hlsl);
+}
+
+#[test]
+fn amplification_dispatch_uses_the_y_and_z_group_counts() {
+    let mut ex = shader(Stage::Amplification, &[S_ENDPGM], vec![], vec![], None);
+    ex.gs_info = Some(GsInfo {
+        input_primitive: 0,
+        output_topology: 0,
+        max_vertex_count: 0,
+        mesh: Some(MeshInfo {
+            stage: 14,
+            groupshared_bytes: 0,
+            payload_bytes: 16,
+            max_vertices: 0,
+            max_primitives: 0,
+            prim_vectors: 0,
+            topology: 0,
+            num_threads: [32, 1, 1],
+        }),
+    });
+    let t = translate(&ex).expect("amplification shader translates");
+    assert!(
+        t.hlsl.contains("DispatchMesh(tb_args[0], max(tb_args[1], 1u), max(tb_args[2], 1u), tb_pl);"),
+        "{}",
+        t.hlsl
+    );
+}
+
+fn geometry(prim: u32, topo: u32) -> Result<tombox_xshader::hlsl::Translated, String> {
+    let mut ex = shader(
+        Stage::Geometry,
+        &[S_ENDPGM],
+        vec![sig("POSITION", 0, 3, 0, 0xf)],
+        vec![sig("SV_Position", 1, 3, 0, 0xf)],
+        None,
+    );
+    ex.gs_info = Some(GsInfo { input_primitive: prim, output_topology: topo, max_vertex_count: 1, mesh: None });
+    translate(&ex)
+}
+
+#[test]
+fn geometry_adjacency_primitives_translate() {
+    let tri = geometry(3, 5).expect("triangle");
+    assert!(tri.hlsl.contains("triangle SIn i[3]"), "{}", tri.hlsl);
+    assert!(tri.hlsl.contains("v0 = 0x04000000u; v1 = 0x800u;"), "{}", tri.hlsl);
+    assert!(!tri.hlsl.contains("v2 ="), "{}", tri.hlsl);
+
+    let line = geometry(6, 3).expect("lineadj");
+    assert_eq!(line.profile, "gs_5_0");
+    assert!(line.hlsl.contains("lineadj SIn i[4]"), "{}", line.hlsl);
+    assert!(line.hlsl.contains("v1 = 0xc000800u;"), "{}", line.hlsl);
+    assert!(!line.hlsl.contains("v2 ="), "{}", line.hlsl);
+
+    let adj = geometry(7, 5).expect("triangleadj");
+    assert!(adj.hlsl.contains("triangleadj SIn i[6]"), "{}", adj.hlsl);
+    assert!(adj.hlsl.contains("v2 = 0x14001000u;"), "{}", adj.hlsl);
+
+    let err = match geometry(4, 5) {
+        Err(e) => e,
+        Ok(_) => panic!("primitive 4 is not a GS input"),
+    };
+    assert!(err.contains("input primitive"), "{err}");
+}
+
+fn compute_threads(threads: Option<[u32; 3]>, preamble: [u32; 4]) -> String {
+    let mut ex = shader(Stage::Compute, &[S_ENDPGM], vec![], vec![], None);
+    ex.psv_numthreads = threads;
+    ex.isa_preamble = preamble;
+    translate(&ex).expect("compute shader translates").hlsl
+}
+
+#[test]
+fn compute_numthreads_come_from_psv_when_the_preamble_is_zero() {
+    let h = compute_threads(Some([4, 2, 1]), [0; 4]);
+    assert!(h.contains("[numthreads(4, 2, 1)]"), "{h}");
+    let preamble = compute_threads(Some([4, 2, 1]), [0, 8, 1, 1]);
+    assert!(preamble.contains("[numthreads(8, 1, 1)]"), "{preamble}");
+    let missing = compute_threads(None, [0; 4]);
+    assert!(missing.contains("[numthreads(1, 1, 1)]"), "{missing}");
+}
+
+fn compute_with(words: &[u32], preamble: [u32; 4]) -> String {
+    let mut ex = shader(Stage::Compute, words, vec![], vec![], None);
+    ex.isa_preamble = preamble;
+    translate(&ex).expect("compute shader translates").hlsl
+}
+
+fn consecutive_lds() -> [u32; 7] {
+    [0xd834_0000, 0x0000_0909, 0xd834_0000, 0x0000_0a09, 0xd8d8_0000, 0x0700_0007, S_ENDPGM]
+}
+
+fn consecutive_reads() -> [u32; 5] {
+    [0xd8d8_0000, 0x0700_0007, 0xd8d8_0000, 0x0800_0008, S_ENDPGM]
+}
+
+fn barriers_between_first_lds(h: &str) -> usize {
+    let body = h.split("void main").nth(1).expect("compute entry");
+    let first = body.find("tb_lds[").expect("first LDS access");
+    let second = body[first + 1..].find("tb_lds[").map(|p| first + 1 + p).expect("second LDS access");
+    body[first..second].matches("GroupMemoryBarrierWithGroupSync();").count()
+}
+
+#[test]
+fn one_wave_compute_separates_consecutive_lds_writes() {
+    let h = compute_with(&consecutive_lds(), [0, 8, 8, 1]);
+    assert!(h.contains("[numthreads(8, 8, 1)]"), "{h}");
+    assert_eq!(barriers_between_first_lds(&h), 1, "{h}");
+
+    let big = compute_with(&consecutive_lds(), [0, 16, 16, 1]);
+    assert!(big.contains("[numthreads(16, 16, 1)]"), "{big}");
+    assert_eq!(barriers_between_first_lds(&big), 0, "{big}");
+
+    let reads = compute_with(&consecutive_reads(), [0, 8, 8, 1]);
+    assert_eq!(barriers_between_first_lds(&reads), 0, "{reads}");
+
+    let mut barred = consecutive_lds().to_vec();
+    barred.insert(2, 0xbf8a_0000);
+    let barred = compute_with(&barred, [0, 8, 8, 1]);
+    assert_eq!(barriers_between_first_lds(&barred), 1, "{barred}");
+
+    let unknown = compute_with(&consecutive_lds(), [0; 4]);
+    assert_eq!(barriers_between_first_lds(&unknown), 0, "{unknown}");
+}
+
+#[test]
+fn d16_texel_type_looks_through_half_packing() {
+    let root = || Some(RootSig {
+        version: 2,
+        flags: 1,
+        params: vec![table(0, 64, 5), table(1, 8, 5)],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    });
+    let cs = |words: &[u32]| {
+        let mut ex = shader(Stage::Compute, words, vec![], vec![], root());
+        ex.isa_preamble = [0, 64, 1, 1];
+        (ex.has_input_sig, ex.has_output_sig) = (false, false);
+        ex
+    };
+    let root2 = || Some(RootSig {
+        version: 2,
+        flags: 1,
+        params: vec![table(0, 64, 5), table(3, 16, 5), table(1, 8, 5)],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    });
+    let cs2 = |words: &[u32]| {
+        let mut ex = shader(Stage::Compute, words, vec![], vec![], root2());
+        ex.isa_preamble = [0, 64, 1, 1];
+        (ex.has_input_sig, ex.has_output_sig) = (false, false);
+        ex
+    };
+    let _ = cs;
+    const S_WAITCNT_0: u32 = 0xbf8c_0000;
+    let uav = [0xf40c_0503, 0xfa00_0000, S_WAITCNT_0];
+    let srv = [0xf40c_0202, 0xfa00_0000, S_WAITCNT_0];
+    let store = [0xf020_1f08, 0x8005_0800];
+    let load = [0xf000_1f08, 0x8002_0400];
+
+    let mut w = uav.to_vec();
+    w.extend([
+        0x7e14_1508,
+        0x7e16_1509,
+        0x3614_14ff, 0x0000_ffff,
+        0xd76f_0008, 0x0429_210b,
+        0x7e12_0308,
+    ]);
+    w.extend(store);
+    w.push(S_ENDPGM);
+    let h = translate(&cs2(&w)).expect("f16 packed store").hlsl;
+    assert!(h.contains("RWTexture2D<float4> uav0"), "{h}");
+
+    let mut w = uav.to_vec();
+    w.extend([
+        0x2814_1508,
+        0x3614_14ff, 0x0000_ffff,
+        0xd76f_0008, 0x0429_2109,
+        0x7e12_0308,
+    ]);
+    w.extend(store);
+    w.push(S_ENDPGM);
+    let h = translate(&cs2(&w)).expect("uint packed store").hlsl;
+    assert!(h.contains("RWTexture2D<uint4> uav0"), "{h}");
+    assert!(h.contains("& 0xffffu)") && h.contains(">> 16u)"), "{h}");
+
+    let mut w = uav.to_vec();
+    w.extend([
+        0x2414_1508,
+        0x3614_14ff, 0x0000_ffff,
+        0xd76f_0008, 0x0429_2109,
+        0x7e12_0308,
+    ]);
+    w.extend(store);
+    w.push(S_ENDPGM);
+    let h = translate(&cs2(&w)).expect("sint packed store").hlsl;
+    assert!(h.contains("RWTexture2D<int4> uav0"), "{h}");
+    assert!(h.contains("asint(v8 << 16u) >> 16") && h.contains("asint(v8) >> 16"), "{h}");
+
+    let mut w = srv.to_vec();
+    w.extend(load);
+    w.extend([
+        0x2c10_0890,
+        0x7e10_1708,
+    ]);
+    w.push(S_ENDPGM);
+    let h = translate(&cs2(&w)).expect("f16 packed load").hlsl;
+    assert!(h.contains("Texture2D<float4> tex0"), "{h}");
+
+    let mut w = uav.to_vec();
+    w.extend([
+        0xf044_1108, 0x0005_0400,
+        0xf000_1108, 0x8005_0400,
+        S_ENDPGM,
+    ]);
+    let err = match translate(&cs2(&w)) {
+        Ok(t) => panic!("expected refusal, got:\n{}", t.hlsl),
+        Err(e) => e,
+    };
+    assert!(err.contains("atomic"), "{err}");
+}
+
+#[test]
+fn raw_uav_buffer_atomics_share_ubuf_instead_of_overlapping_utb() {
+    let words = [
+        0xf408_0002, 0xfa00_0000,
+        0x7e02_0284,
+        0x7e06_0287,
+        0xe070_1000, 0x8000_0301,
+        0xe0e8_1004, 0x8000_0301,
+        S_ENDPGM,
+    ];
+    let root = RootSig {
+        version: 2,
+        flags: 0,
+        params: vec![table(1, 1, 0)],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    };
+    let mut ex = shader(Stage::Compute, &words, vec![], vec![], Some(root));
+    ex.isa_preamble = [0, 64, 1, 1];
+    (ex.has_input_sig, ex.has_output_sig) = (false, false);
+    ex.has_psv0 = true;
+    ex.resources.push(PsvResource { res_type: 7, space: 0, lower: 0, upper: 0, kind: 1 });
+    let t = translate(&ex).expect("raw UAV buffer store + atomic");
+    assert!(t.hlsl.contains("ubuf0"), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("utb0"), "overlapping utb0 declaration:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("InterlockedOr(ubuf0["), "{}", t.hlsl);
+    #[cfg(windows)]
+    if tombox_xshader::dxc::available() {
+        let profile = tombox_xshader::dxc::profile_for(t.profile);
+        tombox_xshader::dxc::compile(&t.hlsl, &profile).expect("DXC compile");
     }
 }

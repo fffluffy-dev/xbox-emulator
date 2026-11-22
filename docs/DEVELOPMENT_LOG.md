@@ -20,6 +20,12 @@ Reverse chronological. Each entry: what was done, evidence, blockers, next actio
 - Testing without the developer's PC: CI on GitHub Actions (Windows + WARP + DXC) and a Steam Deck
   as an RDNA2 test machine. Fixes from the Deck: the round-mode fold (#21) and test assumptions
   (#19). Open: DPP with two shuffles, f64 denormals in `div_f64` / `trig_preop`.
+- Synced with upstream omonkeyz/xbox-emulator `main` at `1e77fcc` (its 34 merges after the
+  relicense: user-data CBV and opt-in root-signature inference for shaders without RTS0,
+  image atomics via `atomic_rmw`, mesh / GS / PSV fixes, console libraries 2143/2155, fast-run
+  scenes, CI gate). Kept from this fork where both sides did the same thing: the MIMG TFE status
+  VGPR (upstream refused TFE), store-data registers in live_in, FSSM wave size and VS inputs,
+  memory-descriptor fallback (now also after upstream's "missing root signature" error).
 - Next: memory-descriptor step 3 in d3d12_xs (fill `TbUser`, map windows, keep the T# / S# table).
 
 ---

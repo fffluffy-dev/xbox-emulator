@@ -41,6 +41,8 @@ extern "system" {
     fn GetModuleHandleW(n: *const u16) -> *mut c_void;
     fn VirtualProtect(addr: *mut c_void, size: usize, new_protect: u32, old_protect: *mut u32) -> i32;
     fn Sleep(ms: u32);
+    fn GetCurrentProcess() -> *mut c_void;
+    fn TerminateProcess(p: *mut c_void, code: u32) -> i32;
 }
 
 #[link(name = "user32")]
@@ -68,6 +70,8 @@ extern "system" {
     fn SetWindowPos(h: *mut c_void, after: *mut c_void, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
     fn GetSystemMetrics(i: i32) -> i32;
     fn GetWindowRect(h: *mut c_void, r: *mut [i32; 4]) -> i32;
+    fn SetWindowLongPtrW(h: *mut c_void, idx: i32, v: isize) -> isize;
+    fn CallWindowProcW(prev: isize, h: *mut c_void, msg: u32, w: usize, l: isize) -> isize;
 }
 
 pub(crate) fn start_window_clamp() {
@@ -158,8 +162,131 @@ struct WndClassExW {
     icon_sm: *mut c_void,
 }
 
+const WM_CLOSE: u32 = 0x0010;
+
+unsafe fn end_title_on_close() -> ! {
+    record("d3d12_xs", "window", "close requested: ending the title");
+    TerminateProcess(GetCurrentProcess(), 0);
+    unreachable!("TerminateProcess(self) returned")
+}
+
 unsafe extern "system" fn wndproc(h: *mut c_void, msg: u32, w: usize, l: isize) -> isize {
+    if msg == WM_CLOSE {
+        end_title_on_close();
+    }
     DefWindowProcW(h, msg, w, l)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientRectMode {
+    Window,
+    BackBuffer,
+}
+
+fn parse_client_rect_mode(val: Option<&str>) -> Result<ClientRectMode, String> {
+    match val.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("window") => Ok(ClientRectMode::Window),
+        Some("backbuffer") => Ok(ClientRectMode::BackBuffer),
+        Some(other) => Err(format!("invalid client_rect={other:?} (expected 'window' or 'backbuffer'); using 'window'")),
+    }
+}
+
+fn configured_client_rect_mode() -> ClientRectMode {
+    static MODE: std::sync::OnceLock<ClientRectMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let raw = compat_common::cfg("client_rect");
+        match parse_client_rect_mode(raw.as_deref()) {
+            Ok(m) => m,
+            Err(msg) => {
+                record("d3d12_xs", "window", &msg);
+                ClientRectMode::Window
+            }
+        }
+    })
+}
+
+static TITLE_WNDPROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static TITLE_HWND: AtomicUsize = AtomicUsize::new(0);
+static OUTPUT_SIZE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn output_size() -> Option<(i32, i32)> {
+    let v = OUTPUT_SIZE.load(Ordering::Relaxed);
+    (v != 0).then(|| ((v >> 32) as i32, v as u32 as i32))
+}
+
+unsafe extern "system" fn title_get_client_rect(h: *mut c_void, r: *mut [i32; 4]) -> i32 {
+    let ok = GetClientRect(h, r);
+    if ok != 0 && !r.is_null() && h as usize == TITLE_HWND.load(Ordering::Relaxed) {
+        if let Some((w, hgt)) = output_size() {
+            *r = [0, 0, w, hgt];
+        }
+    }
+    ok
+}
+
+fn scale_point(x: i32, y: i32, client: (i32, i32), out: (i32, i32)) -> (i32, i32) {
+    let sx = if client.0 > 0 { (x as i64 * out.0 as i64 / client.0 as i64) as i32 } else { x };
+    let sy = if client.1 > 0 { (y as i64 * out.1 as i64 / client.1 as i64) as i32 } else { y };
+    (sx, sy)
+}
+
+fn translate_message(msg: u32, w: usize, l: isize, client: (i32, i32), out: (i32, i32)) -> isize {
+    const WM_SIZE: u32 = 0x0005;
+    const SIZE_MINIMIZED: usize = 1;
+    match msg {
+        WM_SIZE if w != SIZE_MINIMIZED => ((out.1 as isize & 0xffff) << 16) | (out.0 as isize & 0xffff),
+        0x0200..=0x020e if msg != 0x020a && msg != 0x020e => {
+            let (x, y) = ((l & 0xffff) as i16 as i32, ((l >> 16) & 0xffff) as i16 as i32);
+            let (x, y) = scale_point(x, y, client, out);
+            (((y as isize) & 0xffff) << 16) | ((x as isize) & 0xffff)
+        }
+        _ => l,
+    }
+}
+
+unsafe extern "system" fn title_wndproc(h: *mut c_void, msg: u32, w: usize, l: isize) -> isize {
+    if msg == WM_CLOSE {
+        end_title_on_close();
+    }
+    let mut l = l;
+    if let Some(out) = output_size() {
+        if (msg == 0x0005 || (0x0200..=0x020e).contains(&msg)) && h as usize == TITLE_HWND.load(Ordering::Relaxed) {
+            let mut r = [0i32; 4];
+            GetClientRect(h, &mut r);
+            l = translate_message(msg, w, l, (r[2] - r[0], r[3] - r[1]), out);
+        }
+    }
+    CallWindowProcW(TITLE_WNDPROC.load(Ordering::Relaxed), h, msg, w, l)
+}
+
+unsafe fn close_ends_title(hwnd: usize) {
+    if TITLE_WNDPROC.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    const GWLP_WNDPROC: i32 = -4;
+    let prev = SetWindowLongPtrW(hwnd as *mut c_void, GWLP_WNDPROC, title_wndproc as *const () as isize);
+    if prev == 0 {
+        record("d3d12_xs", "window", "could not hook the title window's close button");
+        return;
+    }
+    TITLE_WNDPROC.store(prev, Ordering::Relaxed);
+}
+
+unsafe fn fix_output_size(hwnd: usize, width: u64, height: u32) {
+    OUTPUT_SIZE.store((width << 32) | height as u64, Ordering::Relaxed);
+    TITLE_HWND.store(hwnd, Ordering::Relaxed);
+    const GWLP_WNDPROC: i32 = -4;
+    if TITLE_WNDPROC.load(Ordering::Relaxed) == 0 {
+        let prev = SetWindowLongPtrW(hwnd as *mut c_void, GWLP_WNDPROC, title_wndproc as *const () as isize);
+        if prev != 0 {
+            TITLE_WNDPROC.store(prev, Ordering::Relaxed);
+        }
+    }
+    let user32 = LoadLibraryA(b"user32.dll\0".as_ptr());
+    let real = GetProcAddress(user32, b"GetClientRect\0".as_ptr()) as usize;
+    let n = compat_common::iat::redirect_main_module(real, title_get_client_rect as *const () as usize);
+    record("d3d12_xs", "window", &format!(
+        "client_rect=backbuffer: title window reports {width}x{height} ({n} GetClientRect import slot(s); WM_SIZE and mouse coordinates translated)"));
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -192,12 +319,19 @@ fn create_window(client_w: i32, client_h: i32) -> usize {
         const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
         let mut r = [0i32, 0, client_w, client_h];
         AdjustWindowRect(&mut r, WS_OVERLAPPEDWINDOW, 0);
+        let headless = compat_common::headless::enabled();
+        let ex = if headless { compat_common::headless::top_level_styles(WS_OVERLAPPEDWINDOW, 0).ex } else { 0 };
         let hwnd = CreateWindowExW(
-            0, class.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW, 80, 80, r[2] - r[0], r[3] - r[1],
+            ex, class.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW, 80, 80, r[2] - r[0], r[3] - r[1],
             core::ptr::null_mut(), core::ptr::null_mut(), inst, core::ptr::null_mut(),
         );
         if !hwnd.is_null() {
-            ShowWindow(hwnd, 5); // SW_SHOW
+            if headless {
+                compat_common::headless::cloak(hwnd);
+                ShowWindow(hwnd, compat_common::headless::SW_SHOWNA);
+            } else {
+                ShowWindow(hwnd, 5);
+            }
         }
         let _ = tx.send(hwnd as usize);
         let mut msg = [0u8; 48];
@@ -292,7 +426,11 @@ unsafe fn init(queue: *mut c_void, src: *mut c_void) -> Result<State, String> {
     let own = std::env::var("TOMBOX_OWN_WINDOW").map(|v| v == "1").unwrap_or(false);
     let mut hwnd = if own { 0 } else { find_title_window() };
     if hwnd != 0 {
+        if configured_client_rect_mode() == ClientRectMode::BackBuffer {
+            fix_output_size(hwnd, width, height);
+        }
         (cw, ch) = fit_window_to_aspect(hwnd, width, height);
+        close_ends_title(hwnd);
         let mut cls = [0u16; 128];
         let n = GetClassNameW(hwnd as *mut c_void, cls.as_mut_ptr(), 128).max(0) as usize;
         record("d3d12_xs", "PresentX", &format!(
@@ -304,6 +442,11 @@ unsafe fn init(queue: *mut c_void, src: *mut c_void) -> Result<State, String> {
         }
         record("d3d12_xs", "PresentX", "title window not found (or TOMBOX_OWN_WINDOW=1): presenting into a TomBox host window");
     }
+    if compat_common::headless::enabled() {
+        let hr = compat_common::headless::cloak(hwnd as *mut c_void);
+        record("d3d12_xs", "PresentX", &format!("TOMBOX_HEADLESS: present window {hwnd:#x} cloaked (hr={hr:#010x}, cloaked={})", compat_common::headless::is_cloaked(hwnd as *mut c_void)));
+    }
+    crate::capture::start();
 
     let dxgi = LoadLibraryA(b"dxgi.dll\0".as_ptr());
     let create = GetProcAddress(dxgi, b"CreateDXGIFactory2\0".as_ptr());
@@ -378,7 +521,7 @@ unsafe fn snap_buffers(queue: *mut c_void, st: &State) -> Option<(*mut c_void, *
     if vcall!(queue, 7, fn(*const Guid, *mut *mut c_void) -> i32, &IID_DEVICE, &mut device) < 0 || device.is_null() {
         return None;
     }
-    let size = crate::present_snap::row_pitch(st.width as u32) as u64 * st.height as u64;
+    let size = crate::present_snap::pitch_for(st.width as u32, st.format) as u64 * st.height as u64;
     let heap: [u32; 5] = [3, 0, 0, 1, 1];
     let mut bd = [0u8; 0x38];
     bd[0..4].copy_from_slice(&1u32.to_le_bytes());
@@ -406,6 +549,61 @@ unsafe fn snap_buffers(queue: *mut c_void, st: &State) -> Option<(*mut c_void, *
     Some((out[0], out[1]))
 }
 
+struct CapPending(crate::capture::Req, usize, u64);
+unsafe impl Send for CapPending {}
+static CAP_PENDING: Mutex<Option<CapPending>> = Mutex::new(None);
+
+unsafe fn readback_buffer(device: *mut c_void, size: u64) -> Result<*mut c_void, i32> {
+    let heap: [u32; 5] = [3, 0, 0, 1, 1];
+    let mut bd = [0u8; 0x38];
+    bd[0..4].copy_from_slice(&1u32.to_le_bytes());
+    bd[0x10..0x18].copy_from_slice(&size.to_le_bytes());
+    bd[0x18..0x1c].copy_from_slice(&1u32.to_le_bytes());
+    bd[0x1c..0x1e].copy_from_slice(&1u16.to_le_bytes());
+    bd[0x1e..0x20].copy_from_slice(&1u16.to_le_bytes());
+    bd[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+    bd[0x2c..0x30].copy_from_slice(&1u32.to_le_bytes());
+    let mut out: *mut c_void = core::ptr::null_mut();
+    let hr = vcall!(device, 27, fn(*const u32, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32,
+        heap.as_ptr(), 0, bd.as_ptr(), 0x400, core::ptr::null(), &IID_RESOURCE, &mut out);
+    if hr < 0 || out.is_null() { Err(hr) } else { Ok(out) }
+}
+
+unsafe fn queue_capture(st: &State, src: *mut c_void) {
+    if CAP_PENDING.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+        return;
+    }
+    let Some(req) = crate::capture::take() else { return };
+    let size = crate::present_snap::pitch_for(st.width as u32, st.format) as u64 * st.height as u64;
+    let rb = match readback_buffer(st.device, size) {
+        Ok(rb) => rb,
+        Err(hr) => {
+            crate::capture::fail(&req, &format!("readback buffer {size:#x} hr={hr:#010x}"));
+            return;
+        }
+    };
+    let d = crate::present_snap::footprint_location(rb, st.format, st.width as u32, st.height);
+    let s = crate::present_snap::subresource_location(src);
+    vcall!(st.list, 16, fn(*const u8, u32, u32, u32, *const u8, *const c_void) -> (), d.as_ptr(), 0, 0, 0, s.as_ptr(), core::ptr::null());
+    *CAP_PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(CapPending(req, rb as usize, st.frames + 1));
+}
+
+unsafe fn complete_capture(st: &State) {
+    let Some(CapPending(req, rb, frame)) = CAP_PENDING.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    let rb = rb as *mut c_void;
+    let len = crate::present_snap::pitch_for(st.width as u32, st.format) as usize * st.height as usize;
+    let mut p: *mut u8 = core::ptr::null_mut();
+    let hr = vcall!(rb, 8, fn(u32, *const c_void, *mut *mut u8) -> i32, 0, core::ptr::null(), &mut p);
+    if hr >= 0 && !p.is_null() {
+        let data = core::slice::from_raw_parts(p, len).to_vec();
+        vcall!(rb, 9, fn(u32, *const c_void) -> (), 0, core::ptr::null());
+        crate::capture::finish(req, data, st.width as u32, st.height, st.format, frame);
+    } else {
+        crate::capture::fail(&req, &format!("readback Map hr={hr:#010x}"));
+    }
+    vcall!(rb, 2, fn() -> u32);
+}
+
 unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) -> Result<(), String> {
     const COMMON: u32 = 0; // == PRESENT
     const COPY_DEST: u32 = 0x400;
@@ -419,6 +617,7 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
         return Err("timed out waiting for previous present copy".into());
     }
     crate::present_probe::collect();
+    complete_capture(st);
     crate::overlay::tick(st.hwnd);
     let idx = vcall!(st.swapchain, 36, fn() -> u32);
     let mut dst: *mut c_void = core::ptr::null_mut();
@@ -432,6 +631,7 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
     let pre = [barrier(src, COMMON, COPY_SOURCE), barrier(dst, COMMON, COPY_DEST)];
     vcall!(st.list, 26, fn(u32, *const [u64; 4]) -> (), 2, pre.as_ptr());
     vcall!(st.list, 17, fn(*mut c_void, *mut c_void) -> (), dst, src); // CopyResource
+    queue_capture(st, src);
     let dst_state = if crate::overlay::draw(st.device, queue, st.list, dst, st.sc_format, st.width, st.height) { RENDER_TARGET } else { COPY_DEST };
     let snap_frame = st.frames + 1;
     let snaps = if crate::present_snap::wanted(snap_frame) { snap_buffers(queue, st) } else { None };
@@ -463,7 +663,7 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
             if crate::present_wait::wait_fence(st.fence, st.fence_value, 5000) {
                 let state = crate::gpu_va::state(src as usize);
                 for (tag, rb) in [("title_backbuffer", rb_src), ("presented_swapchain", rb_dst)] {
-                    let len = crate::present_snap::row_pitch(st.width as u32) as usize * st.height as usize;
+                    let len = crate::present_snap::pitch_for(st.width as u32, st.format) as usize * st.height as usize;
                     let mut p: *mut u8 = core::ptr::null_mut();
                     if vcall!(rb, 8, fn(u32, *const c_void, *mut *mut u8) -> i32, 0, core::ptr::null(), &mut p) >= 0 && !p.is_null() {
                         let data = core::slice::from_raw_parts(p, len);
@@ -482,6 +682,7 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
         }
         let hr = vcall!(st.swapchain, 8, fn(u32, u32) -> i32, 0, present_flags());
         if hr < 0 {
+            crate::dred::on_failure(hr, "swapchain Present");
             return Err(format!("swapchain Present hr={hr:#010x}"));
         }
         st.frames += 1;
@@ -497,6 +698,7 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
     vcall!(queue, 14, fn(*mut c_void, u64) -> i32, st.fence, st.fence_value);
     let hr = crate::perf::timed(crate::perf::PFLIP, || vcall!(st.swapchain, 8, fn(u32, u32) -> i32, 0, present_flags()));
     if hr < 0 {
+        crate::dred::on_failure(hr, "swapchain Present");
         return Err(format!("swapchain Present hr={hr:#010x}"));
     }
     st.frames += 1;
@@ -549,7 +751,8 @@ unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes
     crate::gpuprof::on_present();
     crate::hot_reload::on_present();
     crate::present_probe::on_present(src, plane_count, planes);
-    crate::slowcall::time("PresentX upload pump", || crate::perf::timed(crate::perf::UPLOAD, || crate::upload::pump(queue)));
+    crate::upload::register_direct_queue(queue);
+    crate::slowcall::time("PresentX upload pump", || crate::frame_ev::time(crate::frame_ev::UPLOAD, || crate::perf::timed(crate::perf::UPLOAD, || crate::upload::pump(queue))));
     crate::slowcall::time("PresentX replay/rtcap", || crate::perf::timed(crate::perf::RTCAP, || {
         crate::replay::on_present(queue);
         crate::rtcap::maybe_capture(queue, src)
@@ -670,6 +873,7 @@ qthunks!(
 unsafe extern "system" fn signal_x(queue: *mut c_void, fence: *mut c_void, value: u64, _flags: u32) -> i32 {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> i32 =
         core::mem::transmute(REAL_QVT[14].load(Ordering::Relaxed));
+    crate::hang_cap::note_signal(queue, fence, value, "title SignalX");
     let hr = crate::slowcall::time("queue SignalX", || f(queue, fence, value));
     static N: AtomicUsize = AtomicUsize::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 3 {
@@ -741,13 +945,15 @@ unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const
         return;
     }
     crate::sys_ts::note_queue(queue, REAL_QVT[16].load(Ordering::Relaxed), REAL_QVT[17].load(Ordering::Relaxed));
+    crate::rtcap::note_submit(queue as usize, &title, &real);
     let split = crate::cl2_state::before_execute(queue, &real);
     crate::title_heap::sync_for_execute(&real);
     crate::title_shadow::before_execute();
     crate::slowcall::time("queue ExecuteCommandLists replay hook", || crate::replay::on_execute(queue, &real));
-    crate::slowcall::time("queue ExecuteCommandLists", || crate::gpu_wait::submit(queue, &real, f, REAL_QVT[14].load(Ordering::Relaxed), REAL_QVT[15].load(Ordering::Relaxed)));
+    crate::hang_cap::note_exec(queue, &title, &real);
+    crate::slowcall::time("queue ExecuteCommandLists", || crate::gpu_wait::submit(queue, &real, f, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)), crate::hang_cap::wait_fn(REAL_QVT[15].load(Ordering::Relaxed))));
     crate::ecl_probe::check("ExecuteCommandLists", queue, REAL_QVT[18].load(Ordering::Relaxed), &title, &real, before);
-    crate::title_shadow::after_execute(queue, REAL_QVT[14].load(Ordering::Relaxed), REAL_QVT[15].load(Ordering::Relaxed));
+    crate::title_shadow::after_execute(queue, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)), crate::hang_cap::wait_fn(REAL_QVT[15].load(Ordering::Relaxed)));
     crate::list_split::after_submit(queue, &real);
     crate::cl2_state::note_executed(queue, &real);
     crate::cl2_state::after_execute(queue, &split);
@@ -836,6 +1042,7 @@ pub fn apply_queue_vtable(queue: *mut c_void) {
             }
             install_qthunks();
             install_qlow();
+            crate::hang_cap::install_queue(&QUEUE_VT, &|i| REAL_QVT[i].load(Ordering::Relaxed));
             QUEUE_VT[10].store(q_exec_dispatch as usize, Ordering::Relaxed);
             QUEUE_VT[16].store(q_freq_dispatch as usize, Ordering::Relaxed);
             QUEUE_VT[17].store(q_calib_dispatch as usize, Ordering::Relaxed);
@@ -855,5 +1062,139 @@ pub fn apply_queue_vtable(queue: *mut c_void) {
             let mut tmp: u32 = 0;
             VirtualProtect(slot0 as *mut c_void, 8, old, &mut tmp);
         }
+    }
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn SendMessageW(h: *mut c_void, msg: u32, w: usize, l: isize) -> isize;
+        fn PostMessageW(h: *mut c_void, msg: u32, w: usize, l: isize) -> i32;
+    }
+
+    const CHILD: &str = "TOMBOX_CLOSE_TEST_CHILD";
+    const WM_APP: u32 = 0x8000;
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+
+    unsafe extern "system" fn title_proc(h: *mut c_void, msg: u32, w: usize, l: isize) -> isize {
+        match msg {
+            WM_APP => {
+                SEEN.fetch_add(1, Ordering::SeqCst);
+                0x5a
+            }
+            WM_CLOSE => 0,
+            _ => DefWindowProcW(h, msg, w, l),
+        }
+    }
+
+    unsafe fn child() -> ! {
+        let class = wide("tombox-close-test");
+        let wc = WndClassExW {
+            size: core::mem::size_of::<WndClassExW>() as u32,
+            style: 0,
+            wndproc: title_proc,
+            cls_extra: 0,
+            wnd_extra: 0,
+            instance: GetModuleHandleW(core::ptr::null()),
+            icon: core::ptr::null_mut(),
+            cursor: core::ptr::null_mut(),
+            background: core::ptr::null_mut(),
+            menu_name: core::ptr::null(),
+            class_name: class.as_ptr(),
+            icon_sm: core::ptr::null_mut(),
+        };
+        if RegisterClassExW(&wc) == 0 {
+            std::process::exit(2);
+        }
+        let hwnd = CreateWindowExW(
+            0, class.as_ptr(), class.as_ptr(), 0, 0, 0, 64, 64,
+            core::ptr::null_mut(), core::ptr::null_mut(), wc.instance, core::ptr::null_mut(),
+        );
+        if hwnd.is_null() {
+            std::process::exit(2);
+        }
+        close_ends_title(hwnd as usize);
+        if SendMessageW(hwnd, WM_APP, 0, 0) != 0x5a || SEEN.load(Ordering::SeqCst) != 1 {
+            std::process::exit(4);
+        }
+        PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        let mut msg = [0u8; 48];
+        while GetMessageW(&mut msg, core::ptr::null_mut(), 0, 0) > 0 {
+            DispatchMessageW(&msg);
+            if SEEN.load(Ordering::SeqCst) == 1 && msg[8..12] == WM_CLOSE.to_le_bytes() {
+                std::process::exit(3);
+            }
+        }
+        std::process::exit(5);
+    }
+
+    #[test]
+    fn close_message_ends_the_title_process() {
+        if std::env::var_os(CHILD).is_some() {
+            unsafe { child() }
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["present::close_tests::close_message_ends_the_title_process", "--exact", "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .env("TOMBOX_LOG", std::env::temp_dir().join("tombox_close_test.log"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "child exit; stdout: {stdout}");
+        assert!(!stdout.contains("test result"), "child finished normally: {stdout}");
+    }
+}
+
+#[cfg(test)]
+mod output_size_tests {
+    use super::*;
+
+    fn lp(x: i32, y: i32) -> isize {
+        (((y as isize) & 0xffff) << 16) | ((x as isize) & 0xffff)
+    }
+
+    #[test]
+    fn client_rect_config_validates_values() {
+        assert_eq!(parse_client_rect_mode(None).unwrap(), ClientRectMode::Window);
+        assert_eq!(parse_client_rect_mode(Some("")).unwrap(), ClientRectMode::Window);
+        assert_eq!(parse_client_rect_mode(Some("window")).unwrap(), ClientRectMode::Window);
+        assert_eq!(parse_client_rect_mode(Some("WINDOW")).unwrap(), ClientRectMode::Window);
+        assert_eq!(parse_client_rect_mode(Some("backbuffer")).unwrap(), ClientRectMode::BackBuffer);
+        assert_eq!(parse_client_rect_mode(Some(" BackBuffer ")).unwrap(), ClientRectMode::BackBuffer);
+        let err = parse_client_rect_mode(Some("stretched")).unwrap_err();
+        assert!(err.contains("client_rect"), "{err}");
+    }
+
+    #[test]
+    fn wm_size_reports_the_output_size_unless_minimized() {
+        let (client, out) = ((1600, 874), (1904, 1041));
+        assert_eq!(translate_message(0x0005, 0, lp(1600, 874), client, out), lp(1904, 1041));
+        assert_eq!(translate_message(0x0005, 2, lp(1920, 1009), client, out), lp(1904, 1041), "maximized");
+        assert_eq!(translate_message(0x0005, 1, 0, client, out), 0, "minimized stays 0x0");
+    }
+
+    #[test]
+    fn client_mouse_coordinates_scale_to_the_output() {
+        let (client, out) = ((1600, 874), (1904, 1041));
+        assert_eq!(translate_message(0x0200, 0, lp(800, 437), client, out), lp(952, 520));
+        assert_eq!(translate_message(0x0201, 0, lp(1599, 873), client, out), lp(1902, 1039));
+        assert_eq!(translate_message(0x0200, 0, lp(-16, -8), client, out), lp(-19, -9));
+    }
+
+    #[test]
+    fn wheel_and_other_messages_are_untouched() {
+        let (client, out) = ((1600, 874), (1904, 1041));
+        for msg in [0x020a, 0x020e, 0x0100, 0x0010] {
+            assert_eq!(translate_message(msg, 0, lp(100, 200), client, out), lp(100, 200), "msg {msg:#x}");
+        }
+    }
+
+    #[test]
+    fn zero_client_area_leaves_coordinates() {
+        assert_eq!(scale_point(5, 7, (0, 0), (1904, 1041)), (5, 7));
     }
 }

@@ -318,6 +318,12 @@ pub(crate) fn color_in(d: &mut Dcc, t: &mut Tmp) -> Result<(), i32> {
             for p in 0..64 {
                 t.ever[p] = p >= 54 || (t.ever[p] && (16..48).contains(&p));
             }
+        } else if crate::dcc::xg_build() == 22621 {
+            t.b[56..64].copy_from_slice(&8u64.to_le_bytes());
+            t.b[52..56].fill(0);
+            for p in 0..64 {
+                t.ever[p] = p >= 52 || (t.ever[p] && (24..52).contains(&p));
+            }
         } else {
             t.ever = [false; 64];
         }
@@ -347,21 +353,22 @@ pub(crate) fn channel_in(d: &mut Dcc, t: &mut Tmp) -> Result<(), i32> {
     Ok(())
 }
 
-pub(crate) fn conv_residue(p: Option<usize>) -> ([u8; 64], [bool; 64]) {
-    if crate::dcc::xg_build() == 19041 {
-        return ([0; 64], [true; 64]);
+pub(crate) fn conv_known() -> u32 {
+    #[cfg(test)]
+    if let Some(m) = std::env::var("TOMBOX_DCC_CONV_KNOWN").ok().and_then(|x| u32::from_str_radix(&x, 16).ok()) {
+        return m;
     }
+    if crate::dcc::xg_build() == 19041 { 0 } else { 1 }
+}
+
+pub(crate) fn conv_seen(p: Option<usize>) -> [u8; 64] {
     let mut b = [0u8; 64];
-    b[0] = 0x3d;
-    b[8..16].fill(0xff);
-    b[48] = 0x3d;
-    b[56] = 0x32;
-    let mut k = [true; 64];
-    match p {
-        Some(v) => b[16..24].copy_from_slice(&(v as u64).to_le_bytes()),
-        None => k[16..22].fill(false),
+    if crate::dcc::xg_build() == 19041 {
+        return b;
     }
-    (b, k)
+    let _ = p;
+    b[0] = 0x3d;
+    b
 }
 
 pub(crate) fn run_model(d: &mut Dcc, fills: &[[u8; 64]; 3], conv: &[u8; 64]) -> Result<(), i32> {

@@ -181,6 +181,7 @@ pub fn vop3(op: u32) -> Option<&'static str> {
         0x344 => "v_perm_b32", 0x351 => "v_min3_f16", 0x354 => "v_max3_f16", 0x357 => "v_med3_f16",
         0x360 => "v_readlane_b32", 0x361 => "v_writelane_b32", 0x363 => "v_bfm_b32", 0x364 => "v_bcnt_u32_b32",
         0x34b => "v_fma_f16",
+        0x404 => "v_pk_lshlrev_b16", 0x405 => "v_pk_lshrrev_b16",
         0x40e => "v_pk_fma_f16", 0x40f => "v_pk_add_f16", 0x410 => "v_pk_mul_f16", 0x411 => "v_pk_min_f16", 0x412 => "v_pk_max_f16",
         0x421 => "v_fma_mixlo_f16", 0x422 => "v_fma_mixhi_f16",
         0x420 => "v_fma_mix_f32", // VOP3P opcode 0x20 (see rdna2.rs: VOP3P opcodes are offset by 0x400)
@@ -321,7 +322,8 @@ pub fn mubuf(op: u32) -> Option<&'static str> {
     Some(match op {
         0x00 => "buffer_load_format_x", 0x01 => "buffer_load_format_xy",
         0x02 => "buffer_load_format_xyz", 0x03 => "buffer_load_format_xyzw",
-        0x04 => "buffer_store_format_x", 0x07 => "buffer_store_format_xyzw",
+        0x04 => "buffer_store_format_x", 0x05 => "buffer_store_format_xy",
+        0x06 => "buffer_store_format_xyz", 0x07 => "buffer_store_format_xyzw",
         0x08 => "buffer_load_ubyte", 0x09 => "buffer_load_sbyte", 0x0a => "buffer_load_ushort",
         0x0b => "buffer_load_sshort", 0x0c => "buffer_load_dword", 0x0d => "buffer_load_dwordx2",
         0x0e => "buffer_load_dwordx4", 0x0f => "buffer_load_dwordx3", 0x18 => "buffer_store_byte",
@@ -401,7 +403,7 @@ pub fn lookup(enc: Enc, op: u32) -> Option<&'static str> {
             0x18 => Some("ds_gws_sema_release_all"), 0x19 => Some("ds_gws_init"), 0x1a => Some("ds_gws_sema_v"),
             0x1b => Some("ds_gws_sema_br"), 0x1c => Some("ds_gws_sema_p"), 0x1d => Some("ds_gws_barrier"),
             0x3d => Some("ds_consume"), 0x3e => Some("ds_append"), 0x3f => Some("ds_ordered_count"),
-            0x1e => Some("ds_write_b8"), 0x1f => Some("ds_write_b16"),
+            0x1e => Some("ds_write_b8"), 0x1f => Some("ds_write_b16"), 0xa1 => Some("ds_write_b16_d16_hi"),
             0x39 => Some("ds_read_i8"), 0x3a => Some("ds_read_u8"), 0x3b => Some("ds_read_i16"), 0x3c => Some("ds_read_u16"),
             _ => None,
         },

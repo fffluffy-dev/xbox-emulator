@@ -18,8 +18,15 @@ pub fn comp_count(idx: u32) -> Option<u32> {
     })
 }
 
+pub fn fmt_row(fmt: u32) -> [u32; 3] {
+    if fmt == 104 && xg_build() == 19041 {
+        return [0, 0, 0];
+    }
+    FMT[fmt as usize]
+}
+
 pub fn safe_format(fmt: u32) -> bool {
-    fmt >= 1 && fmt <= 0x78 && comp_count(FMT[fmt as usize][0]).is_some()
+    fmt >= 1 && fmt <= 0x78 && comp_count(fmt_row(fmt)[0]).is_some()
 }
 
 pub struct Dcc {
@@ -76,7 +83,7 @@ impl Dcc {
         } else {
             self.w32(0, 0xf + (sw & 3));
         }
-        let [idx, w4, w7] = FMT[fmt as usize];
+        let [idx, w4, w7] = fmt_row(fmt);
         let bpe = 1u32 << LOG2[(idx & 63) as usize];
         let r11 = (w7.wrapping_sub(1) & !2) == 0;
         self.w32(4, bpe);
@@ -118,15 +125,33 @@ pub fn decode(count: u32, src: &[u8], meta: &[u8], dst: &mut [u8], fmt: u32, sw:
     if let Err(e) = d.init(fmt, sw, dim, p0, p1) {
         return e;
     }
+    let mut undef = Vec::with_capacity(count as usize);
     for i in 0..count as usize {
         d.b[1].copy_from_slice(&src[i * 256..i * 256 + 256]);
         d.w32(0x58, meta[i] as u32);
-        if let Err(e) = dec::run(&mut d) {
-            return e;
+        match dec::run_block(&mut d) {
+            Ok(u) => undef.push(u),
+            Err(e) => return e,
         }
         dst[i * 256..i * 256 + 256].copy_from_slice(&d.b[0]);
     }
+    set_undefined(undef);
     S_OK
+}
+
+fn set_undefined(v: Vec<bool>) {
+    LAST_UNDEF.with(|c| *c.borrow_mut() = v);
+}
+
+pub fn last_undefined() -> Vec<bool> {
+    LAST_UNDEF.with(|c| c.borrow().clone())
+}
+
+fn note_undefined(api: &str, undef: &[bool], fmt: u32, sw: u32) {
+    let ids: Vec<usize> = undef.iter().enumerate().filter(|(_, &u)| u).map(|(i, _)| i).collect();
+    if !ids.is_empty() {
+        compat_common::record(crate::M, api, &format!("format {} swizzle {}: blocks {:?} of {} read console stack scratch that no console code writes before the read, so their output bytes are undefined on the console too; native returns S_OK and writes those blocks from a zero realization of that scratch", fmt, sw, &ids[..ids.len().min(16)], undef.len()));
+    }
 }
 
 pub unsafe fn decode_export(count: u32, src: *const u8, meta: *const u8, dst: *mut u8, fmt: u32, sw: u32, dim: u32, params: *const u32) -> i32 {
@@ -142,22 +167,54 @@ pub unsafe fn decode_export(count: u32, src: *const u8, meta: *const u8, dst: *m
     if let Err(e) = d.init(fmt, sw, dim, p0, p1) {
         return e;
     }
+    let mut undef = Vec::with_capacity(count as usize);
     for i in 0..count as usize {
         core::ptr::copy_nonoverlapping(src.add(i * 256), d.b[1].as_mut_ptr(), 256);
         let m = *meta.add(i);
         d.w32(0x58, m as u32);
-        if let Err(e) = dec::run(&mut d) {
-            compat_common::record(crate::M, "XGDecodeDCC", &format!("block {} meta {:#04x} format {} swizzle {}: console output for this block is undefined (integer-divide fault in its color stage, or bytes taken from uninitialised stack/buffer memory), native rejects", i, m, fmt, sw));
-            return e;
+        match dec::run_block(&mut d) {
+            Ok(u) => undef.push(u),
+            Err(e) => {
+                let why = if dec::last_unmodeled() { "its remap temp holes are driver-frame locals that console code writes (unpack 0x23560 / tid 0x244d8 / seg_info 0x4af40 / the previous relayout temp) and native does not model them yet" } else { "the console faults in its color stage (integer divide or /GS)" };
+                compat_common::record(crate::M, "XGDecodeDCC", &format!("block {} meta {:#04x} format {} swizzle {}: {}; native rejects", i, m, fmt, sw, why));
+                return e;
+            }
         }
         core::ptr::copy_nonoverlapping(d.b[0].as_ptr(), dst.add(i * 256), 256);
     }
+    note_undefined("XGDecodeDCC", &undef, fmt, sw);
+    set_undefined(undef);
     S_OK
 }
 
 thread_local! {
     pub(crate) static ENTRY: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
     pub(crate) static VARY: core::cell::Cell<u32> = const { core::cell::Cell::new(!0) };
+    static STUB_E: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static LAST_UNDEF: core::cell::RefCell<Vec<bool>> = const { core::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LAST_E: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+pub(crate) extern "system" fn set_entry(e: usize) {
+    STUB_E.with(|c| c.set(e));
+}
+
+pub(crate) fn take_entry() -> Option<usize> {
+    let e = STUB_E.with(|c| c.replace(0));
+    #[cfg(test)]
+    LAST_E.with(|c| c.set(e));
+    (e != 0).then_some(e)
+}
+
+pub(crate) fn with_entry<R>(e: Option<usize>, f: impl FnOnce() -> R) -> R {
+    let old = ENTRY.with(|c| c.replace(e));
+    let r = f();
+    ENTRY.with(|c| c.set(old));
+    r
 }
 
 pub(crate) const CONV_FROM_ENTRY: usize = 0x1968;
@@ -211,30 +268,45 @@ fn unknowns(k: u64) -> [u8; 64] {
     }
 }
 
-fn enc_block(d: &mut Dcc) -> Result<u32, i32> {
+pub(crate) const SAMPLES: u64 = 7;
+
+fn enc_block(d: &mut Dcc) -> Result<(u32, bool, bool), i32> {
     let pre = Dcc { m: d.m.clone(), b: d.b };
     let p = ENTRY.with(|c| c.get()).map(|e| e.wrapping_sub(CONV_FROM_ENTRY));
-    let (cb, ck) = enc::conv_residue(p);
+    let seen = enc::conv_seen(p);
     let mut runs = Vec::new();
     let vary = VARY.with(|v| v.get());
-    for k in 0..5u64 {
+    for k in 0..SAMPLES {
         let q = |b: u32, x: u64| if vary >> b & 1 != 0 { x } else { 7 };
         let fills = [unknowns(q(0, 3 * k)), unknowns(q(1, 3 * k + 1)), unknowns(q(2, 3 * k + 2))];
-        let r = unknowns(q(3, 100 + k));
-        let mut conv = cb;
-        for i in 0..64 {
-            if !ck[i] {
-                conv[i] = r[i];
+        let mut conv = match (vary >> 3 & 1 != 0, k) {
+            (false, _) | (true, 0) => seen,
+            (true, k) => {
+                let mut r = unknowns(100 + k);
+                let km = enc::conv_known();
+                for qd in 0..8 {
+                    if km >> qd & 1 != 0 {
+                        r[qd * 8..qd * 8 + 8].copy_from_slice(&seen[qd * 8..qd * 8 + 8]);
+                    }
+                }
+                r
+            }
+        };
+        if vary >> 3 & 1 == 0 && vary >> 8 & 0xff != 0 && k > 0 {
+            let r = unknowns(100 + k);
+            for qd in 0..8 {
+                if vary >> (8 + qd) & 1 != 0 {
+                    conv[qd * 8..qd * 8 + 8].copy_from_slice(&r[qd * 8..qd * 8 + 8]);
+                }
             }
         }
         runs.push(enc_try(&pre, &fills, &conv)?);
     }
-    if runs[1..].iter().all(|r| same(r, &runs[0])) {
-        let (t, s) = runs.swap_remove(0);
-        *d = t;
-        return Ok(s);
-    }
-    Err(E_INVALIDARG)
+    let defined = runs[1..].iter().all(|r| same(r, &runs[0]));
+    let carried = runs[1..].iter().all(|r| r.0.m == runs[0].0.m && r.0.b == runs[0].0.b);
+    let (t, s) = runs.swap_remove(0);
+    *d = t;
+    Ok((s, !defined, !carried))
 }
 
 fn block_size(d: &Dcc) -> Result<u32, i32> {
@@ -254,10 +326,15 @@ pub fn encode(count: u32, src: &[u8], dst: &mut [u8], meta: &mut [u8], mut sizes
     if let Err(e) = d.init(fmt, sw, dim, p0, p1) {
         return e;
     }
+    let (mut undef, mut taint) = (Vec::with_capacity(count as usize), false);
     for i in 0..count as usize {
         d.b[0].copy_from_slice(&src[i * 256..i * 256 + 256]);
         let size = match enc_block(&mut d) {
-            Ok(s) => s,
+            Ok((s, u, c)) => {
+                undef.push(u || taint);
+                taint |= c;
+                s
+            }
             Err(e) => return e,
         };
         if let Some(s) = sizes.as_deref_mut() {
@@ -266,6 +343,7 @@ pub fn encode(count: u32, src: &[u8], dst: &mut [u8], meta: &mut [u8], mut sizes
         dst[i * 256..i * 256 + 256].copy_from_slice(&d.b[1]);
         meta[i] = d.r8(0x58);
     }
+    set_undefined(undef);
     S_OK
 }
 
@@ -282,12 +360,17 @@ pub unsafe fn encode_export(count: u32, src: *const u8, dst: *mut u8, meta: *mut
     if let Err(e) = d.init(fmt, sw, dim, p0, p1) {
         return e;
     }
+    let (mut undef, mut taint) = (Vec::with_capacity(count as usize), false);
     for i in 0..count as usize {
         core::ptr::copy_nonoverlapping(src.add(i * 256), d.b[0].as_mut_ptr(), 256);
         let size = match enc_block(&mut d) {
-            Ok(s) => s,
+            Ok((s, u, c)) => {
+                undef.push(u || taint);
+                taint |= c;
+                s
+            }
             Err(e) => {
-                compat_common::record(crate::M, "XGEncodeDCC", &format!("block {} format {} swizzle {} dim {} params {:#x},{:#x}: the console output for this block depends on stack scratch that native does not model for this build (relayout 0x4ac90 / convert 0x4adc0 holes carrying caller-stack addresses, channel/colour locals or pre-driver frame bytes), or its colour stage faults; native rejects", i, fmt, sw, dim, p0, p1));
+                compat_common::record(crate::M, "XGEncodeDCC", &format!("block {} format {} swizzle {} dim {} params {:#x},{:#x}: the console faults in this block's colour stage (integer divide or /GS) for some or all contents of its uninitialised stack scratch; native rejects", i, fmt, sw, dim, p0, p1));
                 return e;
             }
         };
@@ -297,6 +380,8 @@ pub unsafe fn encode_export(count: u32, src: *const u8, dst: *mut u8, meta: *mut
         core::ptr::copy_nonoverlapping(d.b[1].as_ptr(), dst.add(i * 256), 256);
         *meta.add(i) = d.r8(0x58);
     }
+    note_undefined("XGEncodeDCC", &undef, fmt, sw);
+    set_undefined(undef);
     S_OK
 }
 
@@ -312,5 +397,9 @@ mod oracle_enc;
 mod verify_enc;
 #[cfg(test)]
 mod oracle_cases;
+#[cfg(test)]
+mod oracle_seq;
+#[cfg(test)]
+mod watch;
 pub mod dec;
 pub mod enc;

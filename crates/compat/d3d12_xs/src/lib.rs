@@ -12,11 +12,13 @@
 //! base interface — those will be addressed as the RHI exercises them.
 
 mod device_wrap;
+mod res3d;
 mod dxgi_device;
 mod xone_dxgi;
 mod xone_queue;
 mod ecl_probe;
 mod cbv_raw;
+mod hang_cap;
 mod bl_alias;
 mod vs_snorm;
 mod pso_async;
@@ -39,11 +41,14 @@ mod mip_bind;
 mod present;
 mod overlay;
 mod frame_csv;
+mod frame_ev;
+mod xlat_index;
 mod overlay_font;
 mod overlay_sensors;
 #[cfg(test)]
 mod overlay_hw;
 mod present_snap;
+mod capture;
 mod present_probe;
 mod frame;
 mod frame_fast;
@@ -51,6 +56,7 @@ mod perf;
 mod present_wait;
 mod qwait;
 mod placed;
+mod guard;
 mod upload;
 mod reaper;
 mod rtcap;
@@ -104,10 +110,12 @@ mod console_slots_mesh;
 mod cl_console_fix;
 mod resolve_x;
 mod device_console_fix;
+mod depth_uav;
 mod pso_ext;
 mod global_bind;
 mod kmd10;
 mod dred;
+mod dred_marks;
 mod title_shadow;
 pub mod perfctr;
 #[cfg(test)]
