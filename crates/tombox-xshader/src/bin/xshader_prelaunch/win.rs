@@ -664,7 +664,7 @@ fn usage() {
     eprintln!("pack root: {}", shader_cache::root().display());
 }
 
-fn main() {
+pub fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut title = String::new();
     let mut name = String::new();

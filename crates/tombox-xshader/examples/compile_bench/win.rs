@@ -2,7 +2,7 @@ use std::time::Instant;
 use tombox_xshader::shader_cache::Fma;
 use tombox_xshader::{dxc, extract, hlsl, runtime_hlsl};
 
-fn main() {
+pub fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut files = Vec::new();
     let mut fma = Fma::default();
