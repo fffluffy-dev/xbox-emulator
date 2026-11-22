@@ -33,7 +33,7 @@ mod centroid;
 mod durango;
 mod mixed;
 mod mimg_d16;
-use mimg_d16::{mimg_data_regs, Lane};
+use mimg_d16::{mimg_data_regs, mimg_tfe, Lane};
 
 pub struct Translated {
     pub hlsl: String,
@@ -294,6 +294,36 @@ fn sig_lookup(sig: &[SigElement], register: u32, chan: usize) -> Option<(usize, 
 }
 
 /// Distinct registers of the given elements, in signature order.
+/// Data registers a buffer/image store or atomic reads from its vdata field (decoded as `dst`),
+/// and whether it also writes vdata back (atomics with GLC). `None` for every other op.
+fn store_data_regs(ins: &Insn) -> Option<(u32, bool)> {
+    let m = ins.mnemonic.as_str();
+    let atomic = m.contains("_atomic_");
+    if !(m.contains("_store") || atomic) {
+        return None;
+    }
+    let glc = match ins.enc {
+        Enc::Mubuf | Enc::Mtbuf => ins.aux.mask & 4 != 0,
+        Enc::Mimg => ins.raw.first().is_some_and(|w| (w >> 13) & 1 != 0),
+        _ => return None,
+    };
+    let n = if ins.enc == Enc::Mimg {
+        mimg_data_regs(ins)
+    } else if atomic {
+        (if m.ends_with("_x2") { 2 } else { 1 }) * (if m.contains("cmpswap") { 2 } else { 1 })
+    } else {
+        let tail = m.rsplit('_').next().unwrap_or("");
+        let comps = match tail {
+            "dwordx2" | "xy" => 2,
+            "dwordx3" | "xyz" => 3,
+            "dwordx4" | "xyzw" => 4,
+            _ => 1,
+        };
+        if m.contains("_d16") { (comps + 1) / 2 } else { comps }
+    };
+    Some((n, atomic && glc))
+}
+
 fn distinct_regs<'s>(it: impl Iterator<Item = &'s SigElement>) -> Vec<u32> {
     let mut v: Vec<u32> = Vec::new();
     for e in it {
@@ -2161,11 +2191,23 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
+            // Store and atomic data sits in the decoded `dst` slot but is read by the op.
+            if let (Some((n, writes)), Some(Opnd::Vgpr(vd))) = (store_data_regs(ins), ins.dst.first()) {
+                for k in 0..n {
+                    let r = *vd as u32 + k;
+                    if !written.contains(&format!("v{r}")) {
+                        live.insert((1, r));
+                    }
+                }
+                if !writes {
+                    continue;
+                }
+            }
             // Multi-register destinations: SMEM loads, MIMG results, 64-bit scalar ops.
             let extra = match ins.enc {
                 Enc::Smem if matches!(ins.op, 0x24 | 0x25) => 1,
                 Enc::Smem => (1u32 << (ins.op & 7)) - 1,
-                Enc::Mimg => mimg_data_regs(ins).saturating_sub(1),
+                Enc::Mimg => (mimg_data_regs(ins) + mimg_tfe(ins) as u32).saturating_sub(1),
                 _ if ins.mnemonic.ends_with("_b64") => 1,
                 _ => 0,
             };
@@ -5309,6 +5351,9 @@ impl<'a> Emitter<'a> {
                 Some(Opnd::Vgpr(b)) => *b,
                 _ => return Err("bvh: bad vaddr".into()),
             };
+            if base as usize + need > 256 {
+                return Err(format!("bvh: address registers v[{base}:{}] run past v255", base as usize + need - 1));
+            }
             (0..need as u8).map(|k| Opnd::Vgpr(base + k)).collect()
         } else {
             addrs
@@ -5358,6 +5403,9 @@ impl<'a> Emitter<'a> {
             Opnd::Vgpr(v) => v,
             _ => return Err("bvh: bad vdata".into()),
         };
+        if vd > 252 {
+            return Err(format!("bvh: result registers v[{vd}:{}] run past v255", vd as u32 + 3));
+        }
         for (k, c) in ["x", "y", "z", "w"].iter().enumerate() {
             self.wv(&Opnd::Vgpr(vd + k as u8), &format!("t{t}.{c}"))?;
         }
@@ -5365,6 +5413,22 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_mimg(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
+        self.emit_mimg_op(idx, ins)?;
+        // TFE: the texel-fail status lands in the VGPR after the returned data. Every D3D12
+        // resource the translator binds is fully resident, so the status is always 0
+        // (resident, no LOD warning); a shader that tests it must see that, not a stale value.
+        if mimg_tfe(ins) {
+            let vd = match ins.dst.first() {
+                Some(Opnd::Vgpr(n)) => *n,
+                _ => return Err("bad vdata".into()),
+            };
+            let st = u8::try_from(vd as u32 + mimg_data_regs(ins)).map_err(|_| format!("{}: TFE status register past v255", ins.mnemonic))?;
+            self.wv(&Opnd::Vgpr(st), "0u")?;
+        }
+        Ok(())
+    }
+
+    fn emit_mimg_op(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
         if ins.mnemonic.starts_with("image_bvh") {
             return self.emit_bvh(ins);
         }
@@ -5410,7 +5474,7 @@ impl<'a> Emitter<'a> {
             return Ok(());
         }
         // Texel-addressed ops (no sampler): image_load / image_store, on SRVs or UAVs.
-        if matches!(ins.mnemonic.as_str(), "image_load" | "image_load_mip" | "image_store" | "image_store_mip" | "image_atomic_add" | "image_atomic_umax") {
+        if matches!(ins.mnemonic.as_str(), "image_load" | "image_load_mip" | "image_store" | "image_store_mip") || ins.mnemonic.starts_with("image_atomic_") {
             let with_mip = ins.mnemonic == "image_load_mip" || ins.mnemonic == "image_store_mip";
             let store = ins.mnemonic.starts_with("image_store");
             let (slot, dim, is_uav) = match rs.first() {
@@ -5459,14 +5523,58 @@ impl<'a> Emitter<'a> {
                 if !as_uint {
                     return Err("image atomic on a non-UAV table".into());
                 }
-                let func = if ins.mnemonic == "image_atomic_add" { "InterlockedAdd" } else { "InterlockedMax" };
+                // GLC (word0 bit 13) selects whether the pre-op value is returned; without it
+                // vdata keeps the operand.
+                let glc = ins.raw.first().is_some_and(|w| (w >> 13) & 1 != 0);
+                // dmask gives the data width: 1 (cmpswap 3) for 32-bit, 3 (cmpswap 0xf) for the
+                // 64-bit forms, which a RWTexture<uint> texel cannot hold.
+                let want = if ins.mnemonic == "image_atomic_cmpswap" { 3 } else { 1 };
+                if ins.aux.mask & 0xf != want {
+                    return Err(format!("{} with dmask {:#x}: only the 32-bit form is supported", ins.mnemonic, ins.aux.mask & 0xf));
+                }
                 let o = Opnd::Vgpr(vd);
                 self.touch(&o);
+                let val = r(&o)?;
+                let target = format!("{uobj}[uint{ncoord}({})]", c.join(", "));
                 let t = self.tmp;
                 self.tmp += 1;
-                self.line(&format!("uint t{t} = 0u;"));
-                self.line(&format!("if (exec_lo & 1u) {func}({uobj}[uint{ncoord}({})], {}, t{t});", c.join(", "), r(&o)?));
-                return self.wv(&o, &format!("t{t}"));
+                let op = &ins.mnemonic["image_atomic_".len()..];
+                let direct = match op {
+                    "add" => Some(("InterlockedAdd", val.clone())),
+                    "sub" => Some(("InterlockedAdd", format!("(0u - {val})"))),
+                    "umin" => Some(("InterlockedMin", val.clone())),
+                    "umax" => Some(("InterlockedMax", val.clone())),
+                    "and" => Some(("InterlockedAnd", val.clone())),
+                    "or" => Some(("InterlockedOr", val.clone())),
+                    "xor" => Some(("InterlockedXor", val.clone())),
+                    "swap" => Some(("InterlockedExchange", val.clone())),
+                    _ => None,
+                };
+                if let Some((func, arg)) = direct {
+                    self.line(&format!("uint t{t} = 0u; if (exec_lo & 1u) {{ {func}({target}, {arg}, t{t}); }}"));
+                } else if op == "cmpswap" {
+                    // vdata = {source, compare}; the texel takes the source when it equals compare.
+                    let cmp = Opnd::Vgpr(vd.checked_add(1).ok_or("image_atomic_cmpswap: compare register past v255")?);
+                    self.touch(&cmp);
+                    self.line(&format!("uint t{t} = 0u; if (exec_lo & 1u) {{ InterlockedCompareExchange({target}, {}, {val}, t{t}); }}", r(&cmp)?));
+                } else {
+                    // No HLSL texel op with these semantics: compare-exchange loop.
+                    let cv = format!("t{t}c");
+                    let new = match op {
+                        "smin" => format!("asuint(min(asint({cv}), asint({val})))"),
+                        "smax" => format!("asuint(max(asint({cv}), asint({val})))"),
+                        "inc" => format!("(({cv} >= {val}) ? 0u : ({cv} + 1u))"),
+                        "dec" => format!("((({cv} == 0u) || ({cv} > {val})) ? {val} : ({cv} - 1u))"),
+                        _ => return Err(format!("{} unsupported", ins.mnemonic)),
+                    };
+                    self.line(&format!(
+                        "uint t{t} = 0u; if (exec_lo & 1u) {{ uint {cv} = {target}; [allow_uav_condition] for (uint t{t}i = 0u; t{t}i < 1024u; t{t}i++) {{ uint t{t}p = 0u; InterlockedCompareExchange({target}, {cv}, {new}, t{t}p); if (t{t}p == {cv}) break; {cv} = t{t}p; }} t{t} = {cv}; }}"
+                    ));
+                }
+                if glc {
+                    self.wv(&o, &format!("t{t}"))?;
+                }
+                return Ok(());
             }
             if store && as_uint {
                 let v = self.mimg_store_lanes(ins, vd, Lane::Uint, "0u")?;

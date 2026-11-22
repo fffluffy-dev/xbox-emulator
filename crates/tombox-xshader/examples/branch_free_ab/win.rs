@@ -1,7 +1,7 @@
 use std::time::Instant;
 use tombox_xshader::{branch_free, dxc};
 
-fn main() {
+pub fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let reps: usize = std::env::var("REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
     for pair in args.chunks(2) {
