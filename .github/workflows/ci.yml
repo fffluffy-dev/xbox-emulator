@@ -1,0 +1,159 @@
+name: ci
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  # Full debug info for ~100 crates and their test binaries overflowed the Windows runner's
+  # disk in runs 3 and 4 (the test step went silent while linking). Line tables keep the
+  # panic locations and cut target/ by several times.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
+jobs:
+  linux-portable:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-portable
+      - name: Test host-independent crates
+        run: >
+          cargo test --no-fail-fast
+          -p tombox-xshader -p tombox-probe -p tombox-pe -p tombox-archive
+          -p tombox-rpf -p tombox-disasm
+
+  windows-xshader:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-xshader
+      - name: Environment
+        shell: pwsh
+        run: |
+          rustc -vV
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Directory | Select-Object Name
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\dxcompiler.dll" | Select-Object FullName
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion
+      - name: Test tombox-xshader (DXC + D3D12 exec tests)
+        run: cargo test -p tombox-xshader --no-fail-fast -- --test-threads=4
+
+  windows-workspace:
+    runs-on: windows-latest
+    timeout-minutes: 240
+    continue-on-error: true
+    env:
+      # Crates a clean clone cannot build yet (#14): unpublished modules / console data blobs,
+      # and the test targets upstream omonkeyz/xbox-emulator#12 fixes. compat-common runs its
+      # lib tests in a separate step (only its online_ready_up_replay test needs backend data).
+      EXCLUDE: >-
+        --exclude gcxaudioext --exclude xaudio2_9 --exclude wldp
+        --exclude gamecorecomproxy --exclude connectedstorageservice_proxystub
+        --exclude xg_xs --exclude xbsc_xs --exclude gamehost --exclude compat-common
+        --exclude kerneltracecontrol
+    steps:
+      - uses: actions/checkout@v4
+      - name: libopus sources (third_party/opus, 316c675fa1c9)
+        shell: pwsh
+        run: |
+          git clone --filter=blob:none https://github.com/xiph/opus.git "$env:RUNNER_TEMP\opus"
+          git -C "$env:RUNNER_TEMP\opus" checkout --quiet 316c675fa1c9
+          "TOMBOX_OPUS_SRC=$env:RUNNER_TEMP\opus" >> $env:GITHUB_ENV
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-workspace
+      - name: Build the audio DLLs audio_titles loads (target-xaudio)
+        shell: pwsh
+        run: |
+          $env:CARGO_TARGET_DIR = "target-xaudio"
+          cargo build --release -p acphal -p chad -p xapu
+          "AUDIO_TITLES_DLL_DIR=$PWD\target-xaudio\release" >> $env:GITHUB_ENV
+      - name: Build workspace
+        id: build
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}
+          cargo build --workspace $($env:EXCLUDE -split ' ') --all-targets --keep-going --message-format=short 2>&1 | Tee-Object -FilePath build.log
+          exit $LASTEXITCODE
+      - name: Test workspace
+        if: always()
+        timeout-minutes: 90
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}
+          cargo test --workspace $($env:EXCLUDE -split ' ') --no-fail-fast 2>&1 | Tee-Object -FilePath test.log
+          exit $LASTEXITCODE
+      - name: Test kerneltracecontrol (without the ETW session tests)
+        if: always()
+        shell: pwsh
+        run: |
+          cargo test -p kerneltracecontrol --no-fail-fast -- --skip reaches_etw 2>&1 | Tee-Object -FilePath test-ktc.log
+          exit $LASTEXITCODE
+      # On the runner (admin token) these tests really start ETW sessions, and the test process
+      # did not exit in run #2 after all 15 tests passed. One process per test, time-boxed, to
+      # find the one that keeps it alive.
+      - name: Probe kerneltracecontrol ETW tests (time-boxed)
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 6
+        shell: pwsh
+        run: |
+          foreach ($t in 'start_heap_trace_reaches_etw', 'start_kernel_trace_reaches_etw') {
+            $j = Start-Job -ScriptBlock { param($t, $d) Set-Location $d; cargo test -p kerneltracecontrol --lib -- --exact "tests::$t" 2>&1 } -ArgumentList $t, $PWD
+            if (Wait-Job $j -Timeout 120) { "== $t exited"; Receive-Job $j | Select-Object -Last 8 } else { "== $t DID NOT EXIT within 120 s"; Receive-Job $j | Select-Object -Last 8; Stop-Job $j; Get-Process | Where-Object { $_.Name -like 'kerneltracecontrol-*' } | Stop-Process -Force }
+          }
+      - name: Test compat-common (lib)
+        if: always()
+        shell: pwsh
+        run: |
+          cargo test -p compat-common --lib --no-fail-fast 2>&1 | Tee-Object -FilePath test-common.log
+          exit $LASTEXITCODE
+      - name: Summary
+        if: always()
+        shell: pwsh
+        run: |
+          "## Build errors" >> $env:GITHUB_STEP_SUMMARY
+          if (Test-Path build.log) { Select-String -Path build.log -Pattern '^error' | Select-Object -First 80 | ForEach-Object { "    $($_.Line)" } >> $env:GITHUB_STEP_SUMMARY }
+          "## Test results" >> $env:GITHUB_STEP_SUMMARY
+          foreach ($f in 'test.log', 'test-ktc.log', 'test-common.log') { if (Test-Path $f) { Select-String -Path $f -Pattern 'test result:|FAILED|panicked|Running ' | Select-Object -First 400 | ForEach-Object { "    $($_.Line)" } >> $env:GITHUB_STEP_SUMMARY } }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-workspace-logs
+          path: |
+            build.log
+            test.log
+            test-ktc.log
+            test-common.log
+          if-no-files-found: ignore
+
+  windows-d3d12-hw:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    continue-on-error: true
+    env:
+      TOMBOX_EXEC_HW: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-d3d12-hw
+      # The d3d12_xs tests marked "needs a D3D12 device/GPU" (#[ignore]): on the runner the only
+      # adapter is the software one, which is what these tests then use.
+      - name: d3d12_xs hardware tests (--ignored hw_)
+        run: cargo test -p d3d12_xs --lib --no-fail-fast hw_ -- --ignored --test-threads=1

@@ -241,8 +241,10 @@ fn swap01(abs: u32, neg: u32) -> (u32, u32) {
 fn smrd_op(op: u32) -> Result<u32, String> {
     match op {
         0x00..=0x04 | 0x08..=0x0c => Ok(op),
-        0x1d => Ok(0x24),
-        0x1e => Ok(0x20),
+        // SI/CI SMRD 0x1d s_dcache_inv_vol (CI), 0x1e s_memtime, 0x1f s_dcache_inv. GFX10 has no
+        // volatile-only invalidate, so both invalidates become s_dcache_inv (0x20).
+        0x1d | 0x1f => Ok(0x20),
+        0x1e => Ok(0x24),
         _ => Err(format!("gfx7 SMRD opcode {op:#x} is not supported")),
     }
 }
@@ -256,6 +258,9 @@ fn convert(ins: &Insn) -> Result<Vec<u32>, String> {
     let at = ins.offset;
     let lit = ins.words.get(1).copied();
     let err = |e: String| format!("gfx7 at {at:#x} ({w:#010x}): {e}");
+    if ins.words.len() < length(ins.enc, w) {
+        return Err(err(format!("instruction truncated: {} of {} dwords before the end of the code", ins.words.len(), length(ins.enc, w))));
+    }
     Ok(match ins.enc {
         Enc::Sop2 => match (w >> 23) & 0x7f {
             0x00..=0x0b | 0x0e..=0x2a | 0x2c => ins.words.clone(),
@@ -380,6 +385,13 @@ fn convert(ins: &Insn) -> Result<Vec<u32>, String> {
         }
         Enc::Vintrp | Enc::Ds | Enc::Exp => ins.words.clone(),
         Enc::Mubuf => {
+            // CI buffer_wbinvl1_vol (0x70) has no GFX10 opcode; like buffer_wbinvl1 (0x71) it is
+            // an L1 invalidate, which GFX10 spells buffer_gl0_inv (0x71).
+            if (w >> 18) & 0x7f == 0x70 {
+                let mut v = ins.words.clone();
+                v[0] = (w & !(0x7f << 18)) | 0x71 << 18;
+                return Ok(v);
+            }
             if (w >> 15) & 1 != 0 {
                 return addr64(ins).map_err(err);
             }
@@ -757,6 +769,29 @@ mod tests {
         assert_eq!(d.last().unwrap().mnemonic, "s_endpgm");
     }
 
+    #[test]
+    fn smrd_memtime_and_cache_invalidates_map_to_their_smem_opcodes() {
+        // SMRD: op[26:22], sdst[21:15]. s_memtime s[4:5]; s_dcache_inv_vol; s_dcache_inv.
+        let smrd = |op: u32, sdst: u32| 0xc000_0000 | op << 22 | sdst << 15;
+        let code = [smrd(0x1e, 4), smrd(0x1d, 0), smrd(0x1f, 0), 0xbf81_0000];
+        let bytes: Vec<u8> = code.iter().flat_map(|d| d.to_le_bytes()).collect();
+        let l = to_rdna2(&bytes).unwrap();
+        let d = crate::rdna2::disassemble(&l.isa);
+        let names: Vec<&str> = d.iter().map(|i| i.mnemonic.as_str()).collect();
+        assert_eq!(names, ["s_memtime", "s_dcache_inv", "s_dcache_inv", "s_endpgm"]);
+        let w0 = u32::from_le_bytes([l.isa[0], l.isa[1], l.isa[2], l.isa[3]]);
+        assert_eq!((w0 >> 6) & 0x7f, 4, "s_memtime keeps its destination s[4:5]");
+    }
+
+    #[test]
+    fn mubuf_l1_invalidates_map_to_gl0_inv() {
+        // MUBUF op[24:18]: CI buffer_wbinvl1_vol 0x70, buffer_wbinvl1 0x71.
+        let code = [0xe000_0000 | 0x70 << 18, 0, 0xe000_0000 | 0x71 << 18, 0, 0xbf81_0000];
+        let l = to_rdna2(&bytes(&code)).unwrap();
+        let d = crate::rdna2::disassemble(&l.isa);
+        assert!(d[..2].iter().all(|i| i.op == 0x71), "{:?}", d.iter().map(|i| &i.mnemonic).collect::<Vec<_>>());
+    }
+
     fn words(b: &[u8]) -> Vec<u32> {
         b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
     }
@@ -920,6 +955,15 @@ mod tests {
         eprintln!("durango -> hlsl: {hok}/{} translated", all.len());
         for (e, n) in &herr {
             eprintln!("  hlsl {n:4}  {e}");
+        }
+    }
+
+    #[test]
+    fn truncated_last_instruction_is_an_error() {
+        // A two-dword encoding (MIMG, MUBUF, VOP3, ...) cut off by the end of the code.
+        for w in [0xf000_0000u32, 0xe000_0000, 0xd200_0000, 0xbe80_03ff] {
+            let e = to_rdna2(&w.to_le_bytes()).err().unwrap_or_else(|| panic!("{w:#010x} lowered"));
+            assert!(e.contains("truncated"), "{w:#010x}: {e}");
         }
     }
 }
