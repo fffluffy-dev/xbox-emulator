@@ -11,7 +11,7 @@ What it does:
 1. Reads `MicrosoftGame.Config`. That gives the identity, version and the `Game` executable.
 2. Scans every `.exe` / `.dll` of the package. It collects their imports, delay imports and DLL names loaded by string.
 3. Sorts every DLL into a group:
-   - **title**: the package ships it;
+   - **title**: the package ships it and the runtime has no replacement. Where the runtime builds a DLL of the same name, the runtime's copy wins. For example, the runtime's `XCurl.dll` sends every transfer through WinHTTP and the network guard, while the console XCurl the title ships crashes off the console. `--prefer-title NAME` keeps the title's copy;
    - **api set**: `api-ms-*` / `ext-ms-*`, which the host resolves and the runtime reroutes for console hosts;
    - **system**: the host provides it;
    - **runtime**: a console library (in `EmbeddedXvd/Windows/System32`, not on the host) that the runtime provides;

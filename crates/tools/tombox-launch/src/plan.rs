@@ -30,6 +30,7 @@ pub struct Inputs {
     pub shipped: BTreeSet<String>,
     pub host: Option<BTreeSet<String>>,
     pub prefer_runtime: BTreeSet<String>,
+    pub prefer_title: BTreeSet<String>,
     pub extra: BTreeSet<String>,
 }
 
@@ -54,8 +55,8 @@ pub fn is_api_set(n: &str) -> bool {
 }
 
 fn classify(n: &str, i: &Inputs) -> Source {
-    if i.shipped.contains(n) && !i.prefer_runtime.contains(n) {
-        return Source::Title;
+    if i.shipped.contains(n) {
+        return if i.runtime.contains(n) && !i.prefer_title.contains(n) { Source::Runtime } else { Source::Title };
     }
     if is_api_set(n) {
         return Source::ApiSet;
@@ -187,21 +188,32 @@ mod tests {
         assert_eq!(src("d3d12_x.dll"), Source::Runtime);
         assert_eq!(src("xmem.dll"), Source::Runtime);
         assert_eq!(src("gameinput.dll"), Source::ConsoleMissing);
-        assert_eq!(src("xcurl.dll"), Source::Title);
+        assert_eq!(src("xcurl.dll"), Source::Runtime);
         assert_eq!(src("api-ms-win-core-kernel32-legacy-l1-1-5.dll"), Source::ApiSet);
         assert_eq!(src("winhttp.dll"), Source::System);
         assert_eq!(src("kernel32.dll"), Source::System);
-        assert_eq!(p.stage, set(&["d3d12_x.dll", "xmem.dll"]));
+        assert_eq!(p.stage, set(&["d3d12_x.dll", "xcurl.dll", "xmem.dll"]));
     }
 
     #[test]
-    fn prefer_runtime_and_extra_stage_on_request() {
+    fn extra_stages_on_request_and_prefer_title_keeps_the_shipped_copy() {
         let mut i = inputs();
         i.host = Some(set(&["kernel32.dll"]));
-        i.prefer_runtime = set(&["xcurl.dll"]);
         i.extra = set(&["kernel32.dll", "notbuilt.dll"]);
         let p = build(&i);
         assert_eq!(p.stage, set(&["d3d12_x.dll", "kernel32.dll", "xcurl.dll", "xmem.dll"]));
+        i.prefer_title = set(&["xcurl.dll"]);
+        let p = build(&i);
+        assert_eq!(p.rows["xcurl.dll"].0, Source::Title);
+        assert!(!p.stage.contains("xcurl.dll"));
+    }
+
+    #[test]
+    fn a_shipped_dll_the_runtime_lacks_stays_the_titles_even_when_preferred() {
+        let mut i = inputs();
+        i.runtime.remove("xcurl.dll");
+        i.prefer_runtime = set(&["xcurl.dll"]);
+        assert_eq!(build(&i).rows["xcurl.dll"].0, Source::Title);
     }
 
     #[test]

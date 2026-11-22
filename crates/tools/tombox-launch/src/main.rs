@@ -13,7 +13,9 @@ const USAGE: &str = "tombox-launch <dump or Mount dir> --runtime <dir with the r
   --work DIR           where the overlay, saves and logs go (default: tombox-run/<identity>)
   --exe NAME           executable to start (default: the Game entry of MicrosoftGame.Config)
   --stage NAME         also stage this runtime DLL beside the executable (repeatable)
-  --prefer-runtime N   stage the runtime's N even though the title ships its own (repeatable)
+  --prefer-title N     keep the title's own N where the runtime has a replacement (repeatable;
+                       by default the runtime's copy wins, e.g. its WinHTTP-based XCurl.dll)
+  --prefer-runtime N   stage the runtime's N even where it would not be (repeatable)
   --env K=V            extra environment for the title (repeatable)
   --prefix DIR         Wine prefix (default: $WINEPREFIX); its system32 is the host DLL set
   --wine CMD           Wine / Proton wine64 used to start the title off Windows (default: $WINE or wine)
@@ -33,6 +35,7 @@ struct Args {
     exe: Option<String>,
     stage: BTreeSet<String>,
     prefer: BTreeSet<String>,
+    prefer_title: BTreeSet<String>,
     env: Vec<(String, String)>,
     prefix: Option<PathBuf>,
     into_prefix: BTreeSet<String>,
@@ -61,6 +64,9 @@ fn parse_args(v: &[String]) -> Result<Args, String> {
             }
             "--prefer-runtime" => {
                 a.prefer.insert(lower(&next(&mut i)?));
+            }
+            "--prefer-title" => {
+                a.prefer_title.insert(lower(&next(&mut i)?));
             }
             "--env" => {
                 let kv = next(&mut i)?;
@@ -293,7 +299,7 @@ fn run(a: Args) -> Result<(), String> {
     };
     let exe_path = find_ci(&lay.mount, &exe).ok_or_else(|| format!("{exe} is not in {}", lay.mount.display()))?;
     let runtime = a.runtime.clone().ok_or("--runtime is required")?;
-    let mut inp = Inputs { prefer_runtime: a.prefer.clone(), extra: a.stage.clone(), ..Default::default() };
+    let mut inp = Inputs { prefer_runtime: a.prefer.clone(), prefer_title: a.prefer_title.clone(), extra: a.stage.clone(), ..Default::default() };
     inp.runtime = dll_names(&runtime);
     if inp.runtime.is_empty() && !a.plan_only {
         return Err(format!("{}: no DLLs; build the runtime or unpack the CI bundle there (--plan works without them)", runtime.display()));
