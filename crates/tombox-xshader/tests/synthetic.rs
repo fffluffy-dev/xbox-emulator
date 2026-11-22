@@ -606,7 +606,6 @@ fn image_ops_with_status_or_r128_bits_are_refused() {
         let e = translate(&shader(Stage::Pixel, &program(0xf000_1108 | 1 << bit), vec![], out(), root())).err().unwrap_or_else(|| panic!("{name} translated"));
         assert!(e.contains(name), "{name}: {e}");
     }
-    // TFE on a load is translated: the status VGPR after the data reads 0 (fully resident).
     translate(&shader(Stage::Pixel, &program(0xf000_1108 | 1 << 16), vec![], out(), root())).expect("image_load with TFE");
 }
 

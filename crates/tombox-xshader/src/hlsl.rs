@@ -1086,8 +1086,7 @@ fn translate_linked_with(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, use
         r => r,
     };
     // No root signature to resolve descriptor tables against: read the descriptors from memory
-    // at run time instead (memdesc.rs). Only as a fallback, so working translations don't change,
-    // and not when the caller asked for the user-data CBV mode (user_data.rs).
+    // at run time instead (memdesc.rs). Only as a fallback, so working translations don't change.
     match r {
         Err(e) if !user_data && ex.root_sig.is_none() && !crate::gcn::is_durango(&ex.fssm) && ["not a root table pointer", "not a buffer descriptor", "not an image descriptor", "in table of kind None", "missing root signature"].iter().any(|k| e.contains(k)) => {
             translate_with(ex, &out_interp, None, BTreeSet::new(), false, true).map_err(|e2| format!("{e2} (memory-descriptor fallback after: {e})"))
@@ -5747,8 +5746,6 @@ impl<'a> Emitter<'a> {
         let w1 = ins.raw.get(1).copied().unwrap_or(0);
         let unorm = (w0 >> 12) & 1 != 0;
         let a16 = (w1 >> 30) & 1 != 0;
-        // TFE on a load / sample is handled in emit_mimg (status 0); elsewhere, and R128 / LWE,
-        // are refused.
         for (bit, name) in [(15, "R128"), (16, "TFE"), (17, "LWE")] {
             if (w0 >> bit) & 1 != 0 && !(bit == 16 && mimg_tfe(ins)) {
                 return Err(format!("{} with {name} set at {:#x} is not translated", ins.mnemonic, ins.offset));
