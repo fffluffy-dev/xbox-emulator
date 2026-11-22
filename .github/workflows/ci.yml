@@ -149,3 +149,44 @@ jobs:
       # adapter is the software one, which is what these tests then use.
       - name: d3d12_xs hardware tests (--ignored hw_)
         run: cargo test -p d3d12_xs --lib --no-fail-fast hw_ -- --ignored --test-threads=1
+
+  # Release build of the runtime DLLs (MSVC: their exports need /EXPORT ordinals and forwarders)
+  # plus the mdbg tracer, as a downloadable bundle for running a title on another machine
+  # (e.g. a Steam Deck under Proton). Same exclusions as windows-workspace (#14).
+  windows-runtime-bundle:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      EXCLUDE: >-
+        --exclude gcxaudioext --exclude xaudio2_9 --exclude wldp
+        --exclude gamecorecomproxy --exclude connectedstorageservice_proxystub
+    steps:
+      - uses: actions/checkout@v4
+      - name: libopus sources (third_party/opus, 316c675fa1c9)
+        shell: pwsh
+        run: |
+          git clone --filter=blob:none https://github.com/xiph/opus.git "$env:RUNNER_TEMP\opus"
+          git -C "$env:RUNNER_TEMP\opus" checkout --quiet 316c675fa1c9
+          "TOMBOX_OPUS_SRC=$env:RUNNER_TEMP\opus" >> $env:GITHUB_ENV
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-runtime-bundle
+      - name: Build runtime DLLs and tools (release)
+        shell: pwsh
+        run: |
+          cargo build --release --workspace $($env:EXCLUDE -split ' ') --lib --bins --keep-going 2>&1 | Tee-Object -FilePath bundle-build.log
+          rustc -O --edition 2021 tools/dev/mdbg.rs -o target/release/mdbg.exe
+      - name: Collect bundle
+        shell: pwsh
+        run: |
+          $out = "tombox-runtime"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Get-ChildItem target/release -File | Where-Object { $_.Extension -in '.dll', '.exe' } | Copy-Item -Destination $out
+          git rev-parse HEAD > "$out/COMMIT.txt"
+          Copy-Item bundle-build.log $out
+          Get-ChildItem $out | Measure-Object -Property Length -Sum | ForEach-Object { "files=$($_.Count) bytes=$($_.Sum)" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tombox-runtime-windows-x64
+          path: tombox-runtime
+          retention-days: 14
