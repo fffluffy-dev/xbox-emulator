@@ -294,6 +294,36 @@ fn sig_lookup(sig: &[SigElement], register: u32, chan: usize) -> Option<(usize, 
 }
 
 /// Distinct registers of the given elements, in signature order.
+/// Data registers a buffer/image store or atomic reads from its vdata field (decoded as `dst`),
+/// and whether it also writes vdata back (atomics with GLC). `None` for every other op.
+fn store_data_regs(ins: &Insn) -> Option<(u32, bool)> {
+    let m = ins.mnemonic.as_str();
+    let atomic = m.contains("_atomic_");
+    if !(m.contains("_store") || atomic) {
+        return None;
+    }
+    let glc = match ins.enc {
+        Enc::Mubuf | Enc::Mtbuf => ins.aux.mask & 4 != 0,
+        Enc::Mimg => ins.raw.first().is_some_and(|w| (w >> 13) & 1 != 0),
+        _ => return None,
+    };
+    let n = if ins.enc == Enc::Mimg {
+        mimg_data_regs(ins)
+    } else if atomic {
+        (if m.ends_with("_x2") { 2 } else { 1 }) * (if m.contains("cmpswap") { 2 } else { 1 })
+    } else {
+        let tail = m.rsplit('_').next().unwrap_or("");
+        let comps = match tail {
+            "dwordx2" | "xy" => 2,
+            "dwordx3" | "xyz" => 3,
+            "dwordx4" | "xyzw" => 4,
+            _ => 1,
+        };
+        if m.contains("_d16") { (comps + 1) / 2 } else { comps }
+    };
+    Some((n, atomic && glc))
+}
+
 fn distinct_regs<'s>(it: impl Iterator<Item = &'s SigElement>) -> Vec<u32> {
     let mut v: Vec<u32> = Vec::new();
     for e in it {
@@ -2159,6 +2189,18 @@ impl<'a> Emitter<'a> {
                     if !written.contains(&nm) {
                         live.insert((if matches!(o, Opnd::Vgpr(_)) { 1 } else { 0 }, *n as u32));
                     }
+                }
+            }
+            // Store and atomic data sits in the decoded `dst` slot but is read by the op.
+            if let (Some((n, writes)), Some(Opnd::Vgpr(vd))) = (store_data_regs(ins), ins.dst.first()) {
+                for k in 0..n {
+                    let r = *vd as u32 + k;
+                    if !written.contains(&format!("v{r}")) {
+                        live.insert((1, r));
+                    }
+                }
+                if !writes {
+                    continue;
                 }
             }
             // Multi-register destinations: SMEM loads, MIMG results, 64-bit scalar ops.
