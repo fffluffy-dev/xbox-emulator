@@ -708,6 +708,121 @@ unsafe fn patch_object(obj: *mut c_void) {
     log("GameInputCreate", &format!("IGameInput {obj:p} wrapped (virtual Xbox gamepad attached)"));
 }
 
+const E_POINTER: i32 = 0x8000_4003u32 as i32;
+const E_NOTFOUND: i32 = 0x8007_0490u32 as i32;
+static NULL_TOKEN: AtomicU64 = AtomicU64::new(0x7000_0000);
+
+unsafe fn null_out(out: *mut *mut c_void, hr: i32) -> i32 {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    *out = core::ptr::null_mut();
+    hr
+}
+unsafe fn null_token(token: *mut u64) -> i32 {
+    if !token.is_null() {
+        *token = NULL_TOKEN.fetch_add(1, Ordering::SeqCst);
+    }
+    S_OK
+}
+unsafe extern "system" fn ng_qi(this: *mut c_void, _iid: *const u8, out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    *out = this;
+    S_OK
+}
+unsafe extern "system" fn ng_ref(_this: *mut c_void) -> u32 {
+    1
+}
+unsafe extern "system" fn ng_timestamp(_this: *mut c_void) -> u64 {
+    let (mut c, mut q) = (0i64, 1i64);
+    QueryPerformanceCounter(&mut c);
+    QueryPerformanceFrequency(&mut q);
+    ((c as i128 * 1_000_000) / q.max(1) as i128) as u64
+}
+unsafe extern "system" fn ng_current(_this: *mut c_void, _kind: u32, _device: *mut c_void, out: *mut *mut c_void) -> i32 {
+    null_out(out, READING_NOT_FOUND)
+}
+unsafe extern "system" fn ng_neighbour(_this: *mut c_void, _reference: *mut c_void, _kind: u32, _device: *mut c_void, out: *mut *mut c_void) -> i32 {
+    null_out(out, READING_NOT_FOUND)
+}
+unsafe extern "system" fn ng_temporal(_this: *mut c_void, _ts: u64, _device: *mut c_void, out: *mut *mut c_void) -> i32 {
+    null_out(out, READING_NOT_FOUND)
+}
+unsafe extern "system" fn ng_reading_cb(_this: *mut c_void, _device: *mut c_void, _kind: u32, _threshold: f32, _ctx: *mut c_void, _cb: usize, token: *mut u64) -> i32 {
+    null_token(token)
+}
+unsafe extern "system" fn ng_device_cb(_this: *mut c_void, _device: *mut c_void, _kind: u32, _filter: u32, _enumk: u32, _ctx: *mut c_void, _cb: usize, token: *mut u64) -> i32 {
+    null_token(token)
+}
+unsafe extern "system" fn ng_misc_cb(_this: *mut c_void, _device: *mut c_void, _ctx: *mut c_void, _cb: usize, token: *mut u64) -> i32 {
+    null_token(token)
+}
+unsafe extern "system" fn ng_stop(_this: *mut c_void, _token: u64) {}
+unsafe extern "system" fn ng_unregister(_this: *mut c_void, _token: u64, _timeout: u64) -> u32 {
+    1
+}
+unsafe extern "system" fn ng_create(_this: *mut c_void, out: *mut *mut c_void) -> i32 {
+    null_out(out, E_NOTIMPL)
+}
+unsafe extern "system" fn ng_aggregate(_this: *mut c_void, _kind: u32, out: *mut *mut c_void) -> i32 {
+    null_out(out, E_NOTIMPL)
+}
+unsafe extern "system" fn ng_find(_this: *mut c_void, _key: *const c_void, out: *mut *mut c_void) -> i32 {
+    null_out(out, E_NOTFOUND)
+}
+unsafe extern "system" fn ng_oem(_this: *mut c_void, _vid: u16, _pid: u16, _sub: u8, _class: u8) -> i32 {
+    S_OK
+}
+unsafe extern "system" fn ng_focus(_this: *mut c_void, _policy: u32) {}
+
+fn null_vtbl() -> &'static [usize; IGAMEINPUT_SLOTS] {
+    static V: std::sync::OnceLock<[usize; IGAMEINPUT_SLOTS]> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        [
+            ng_qi as usize,
+            ng_ref as usize,
+            ng_ref as usize,
+            ng_timestamp as usize,
+            ng_current as usize,
+            ng_neighbour as usize,
+            ng_neighbour as usize,
+            ng_temporal as usize,
+            ng_reading_cb as usize,
+            ng_device_cb as usize,
+            ng_misc_cb as usize,
+            ng_misc_cb as usize,
+            ng_stop as usize,
+            ng_unregister as usize,
+            ng_create as usize,
+            ng_aggregate as usize,
+            ng_find as usize,
+            ng_find as usize,
+            ng_find as usize,
+            ng_find as usize,
+            ng_oem as usize,
+            ng_focus as usize,
+        ]
+    })
+}
+
+#[repr(C)]
+struct NullGameInput {
+    vtbl: *const usize,
+}
+static mut NULL_GI: NullGameInput = NullGameInput { vtbl: core::ptr::null() };
+
+pub fn null_host_input() -> *mut c_void {
+    unsafe {
+        let o = &mut *core::ptr::addr_of_mut!(NULL_GI);
+        if o.vtbl.is_null() {
+            o.vtbl = null_vtbl().as_ptr();
+        }
+        o as *mut NullGameInput as *mut c_void
+    }
+}
+
 unsafe extern "system" fn create_hook(out: *mut *mut c_void) -> i32 {
     let f: unsafe extern "system" fn(*mut *mut c_void) -> i32 = core::mem::transmute(ORIG_CREATE.load(Ordering::SeqCst));
     let hr = f(out);
@@ -715,10 +830,18 @@ unsafe extern "system" fn create_hook(out: *mut *mut c_void) -> i32 {
     if hr >= 0 && !out.is_null() && !(*out).is_null() {
         patch_object(*out);
         start_channel();
-    } else {
-        log("GameInputCreate", &format!("real GameInputCreate failed hr={hr:#x}"));
+        return hr;
     }
-    hr
+    log("GameInputCreate", &format!("real GameInputCreate failed hr={hr:#x}"));
+    if out.is_null() {
+        return hr;
+    }
+    let obj = null_host_input();
+    patch_object(obj);
+    start_channel();
+    *out = obj;
+    log("GameInputCreate", "no host GameInput (e.g. Wine): the title gets an IGameInput with no host devices and the virtual Xbox gamepad");
+    S_OK
 }
 
 fn eq_ascii_nocase(p: *const u8, s: &[u8]) -> bool {
@@ -958,6 +1081,39 @@ fn channel_loop() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn null_host_input_reports_no_devices_and_accepts_registrations() {
+        unsafe {
+            let o = null_host_input();
+            assert_eq!(o, null_host_input());
+            let vt = *(o as *const *const usize);
+            let slot = |i: usize| *vt.add(i);
+            let ts: unsafe extern "system" fn(*mut c_void) -> u64 = core::mem::transmute(slot(3));
+            let (a, b) = (ts(o), ts(o));
+            assert!(b >= a && a > 0);
+            let cur: unsafe extern "system" fn(*mut c_void, u32, *mut c_void, *mut *mut c_void) -> i32 = core::mem::transmute(slot(4));
+            let mut out = 1usize as *mut c_void;
+            assert_eq!(cur(o, KIND_GAMEPAD, core::ptr::null_mut(), &mut out), READING_NOT_FOUND);
+            assert!(out.is_null());
+            assert_eq!(cur(o, KIND_GAMEPAD, core::ptr::null_mut(), core::ptr::null_mut()), E_POINTER);
+            let dev: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut c_void, usize, *mut u64) -> i32 = core::mem::transmute(slot(9));
+            let (mut t1, mut t2) = (0u64, 0u64);
+            assert_eq!(dev(o, core::ptr::null_mut(), KIND_GAMEPAD, 1, 1, core::ptr::null_mut(), 0, &mut t1), S_OK);
+            assert_eq!(dev(o, core::ptr::null_mut(), KIND_GAMEPAD, 1, 1, core::ptr::null_mut(), 0, &mut t2), S_OK);
+            assert!(t1 != 0 && t2 != t1);
+            let unreg: unsafe extern "system" fn(*mut c_void, u64, u64) -> u32 = core::mem::transmute(slot(13));
+            assert_eq!(unreg(o, t1, 0), 1);
+            let find: unsafe extern "system" fn(*mut c_void, *const c_void, *mut *mut c_void) -> i32 = core::mem::transmute(slot(16));
+            let mut f = 1usize as *mut c_void;
+            assert_eq!(find(o, core::ptr::null(), &mut f), E_NOTFOUND);
+            assert!(f.is_null());
+            let qi: unsafe extern "system" fn(*mut c_void, *const u8, *mut *mut c_void) -> i32 = core::mem::transmute(slot(0));
+            let mut q = core::ptr::null_mut();
+            assert_eq!(qi(o, core::ptr::null(), &mut q), S_OK);
+            assert_eq!(q, o);
+        }
+    }
 
     #[test]
     fn parses_press_with_default_and_explicit_ms() {
