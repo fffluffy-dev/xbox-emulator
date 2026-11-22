@@ -358,8 +358,13 @@ fn centroid_priority_lowering_matches_cpu_reference() {
     let mut g = unsafe { if hw { Gpu::new(std::env::var_os("TOMBOX_EXEC_DEBUG").is_some()).expect("d3d12 device") } else { warp() } };
     g.open = false;
     let tier = unsafe { sample_positions_tier(&g) };
-    assert!(!hw || tier >= 2, "hardware adapter reports ProgrammableSamplePositionsTier {tier}");
-    let layouts: &[Layout] = if hw { &[Layout::Programmed, Layout::Standard] } else { &[Layout::Standard] };
+    // Programmed (console) sample positions need ProgrammableSamplePositionsTier 2. An adapter
+    // without it (e.g. vkd3d-proton on RADV) still checks the standard layout.
+    let programmed = hw && tier >= 2;
+    if hw && !programmed {
+        eprintln!("hardware adapter reports ProgrammableSamplePositionsTier {tier}: programmed-position layout skipped, standard layout only");
+    }
+    let layouts: &[Layout] = if programmed { &[Layout::Programmed, Layout::Standard] } else { &[Layout::Standard] };
     for &l in layouts {
         assert!(partial_pixels(l) >= 20, "geometry yields too few partially covered pixels");
     }

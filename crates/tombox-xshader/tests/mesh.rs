@@ -314,6 +314,22 @@ fn gta_mesh_programs_extract_with_mesh_runtime_info() {
     assert!(n >= 3);
 }
 
+/// VendorId of the adapter EnumWarpAdapter returns (IDXGIAdapter::GetDesc, DXGI_ADAPTER_DESC
+/// VendorId at byte 256): 0x1414 for Microsoft's WARP.
+unsafe fn warp_adapter_vendor() -> u32 {
+    const IID_FACTORY4: Guid = Guid(0x1bc6ea02, 0xef36, 0x464f, [0xbf, 0x0c, 0x21, 0xca, 0x39, 0xe5, 0x16, 0x8a]);
+    const IID_ADAPTER: Guid = Guid(0x2411e7e1, 0x12ac, 0x4ccf, [0xbd, 0x14, 0x97, 0x98, 0xe8, 0x53, 0x4d, 0xc0]);
+    let dxgi = LoadLibraryA(b"dxgi.dll\0".as_ptr());
+    let cf: unsafe extern "system" fn(*const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(GetProcAddress(dxgi, b"CreateDXGIFactory1\0".as_ptr()));
+    let mut f: *mut c_void = core::ptr::null_mut();
+    assert!(cf(&IID_FACTORY4, &mut f) >= 0, "CreateDXGIFactory1");
+    let mut ad: *mut c_void = core::ptr::null_mut();
+    assert!(vcall!(f, 27, fn(*const Guid, *mut *mut c_void) -> i32, &IID_ADAPTER, &mut ad) >= 0, "EnumWarpAdapter");
+    let mut desc = [0u8; 304];
+    assert!(vcall!(ad, 8, fn(*mut u8) -> i32, desc.as_mut_ptr()) >= 0, "IDXGIAdapter::GetDesc");
+    u32::from_le_bytes([desc[256], desc[257], desc[258], desc[259]])
+}
+
 unsafe fn warp_device() -> *mut c_void {
     const IID_FACTORY4: Guid = Guid(0x1bc6ea02, 0xef36, 0x464f, [0xbf, 0x0c, 0x21, 0xca, 0x39, 0xe5, 0x16, 0x8a]);
     const IID_ADAPTER: Guid = Guid(0x2411e7e1, 0x12ac, 0x4ccf, [0xbd, 0x14, 0x97, 0x98, 0xe8, 0x53, 0x4d, 0xc0]);
@@ -554,6 +570,14 @@ fn rts0_blob(flags: u32) -> Vec<u8> {
 #[test]
 fn warp_rejects_the_console_force_memory_based_abi_root_flag() {
     unsafe {
+        // The rejection is done by Microsoft's D3D12 runtime validation. Other runtimes that
+        // answer EnumWarpAdapter (vkd3d-proton under Wine/Proton hands out the real GPU) accept
+        // the flag, so the test only applies to the real WARP adapter (vendor 0x1414).
+        let vendor = warp_adapter_vendor();
+        if vendor != 0x1414 {
+            eprintln!("EnumWarpAdapter returned vendor {vendor:#06x}, not Microsoft WARP: root-signature validation test skipped");
+            return;
+        }
         let d = warp_device();
         let create = |flags: u32| {
             let b = rts0_blob(flags);
