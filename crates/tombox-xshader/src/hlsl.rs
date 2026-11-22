@@ -33,7 +33,7 @@ mod centroid;
 mod durango;
 mod mixed;
 mod mimg_d16;
-use mimg_d16::{mimg_data_regs, Lane};
+use mimg_d16::{mimg_data_regs, mimg_tfe, Lane};
 
 pub struct Translated {
     pub hlsl: String,
@@ -2165,7 +2165,7 @@ impl<'a> Emitter<'a> {
             let extra = match ins.enc {
                 Enc::Smem if matches!(ins.op, 0x24 | 0x25) => 1,
                 Enc::Smem => (1u32 << (ins.op & 7)) - 1,
-                Enc::Mimg => mimg_data_regs(ins).saturating_sub(1),
+                Enc::Mimg => (mimg_data_regs(ins) + mimg_tfe(ins) as u32).saturating_sub(1),
                 _ if ins.mnemonic.ends_with("_b64") => 1,
                 _ => 0,
             };
@@ -5365,6 +5365,21 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_mimg(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
+        self.emit_mimg_op(idx, ins)?;
+        // TFE: the texel-fail status lands in the VGPR after the returned data. Every D3D12
+        // resource the translator binds is fully resident, so the status is always 0
+        // (resident, no LOD warning); a shader that tests it must see that, not a stale value.
+        if mimg_tfe(ins) {
+            let vd = match ins.dst.first() {
+                Some(Opnd::Vgpr(n)) => *n,
+                _ => return Err("bad vdata".into()),
+            };
+            self.wv(&Opnd::Vgpr(vd.wrapping_add(mimg_data_regs(ins) as u8)), "0u")?;
+        }
+        Ok(())
+    }
+
+    fn emit_mimg_op(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
         if ins.mnemonic.starts_with("image_bvh") {
             return self.emit_bvh(ins);
         }
