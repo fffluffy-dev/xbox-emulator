@@ -385,7 +385,9 @@ fn convert(ins: &Insn) -> Result<Vec<u32>, String> {
             // CI buffer_wbinvl1_vol (0x70) has no GFX10 opcode; like buffer_wbinvl1 (0x71) it is
             // an L1 invalidate, which GFX10 spells buffer_gl0_inv (0x71).
             if (w >> 18) & 0x7f == 0x70 {
-                return Ok(vec![(w & !(0x7f << 18)) | 0x71 << 18, ins.words[1]]);
+                let mut v = ins.words.clone();
+                v[0] = (w & !(0x7f << 18)) | 0x71 << 18;
+                return Ok(v);
             }
             if (w >> 15) & 1 != 0 {
                 return addr64(ins).map_err(err);
