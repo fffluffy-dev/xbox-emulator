@@ -215,6 +215,29 @@ fn mesh_line_topology_and_wave32() {
     assert!(t.hlsl.contains("tris[gi] = uint2(tb_prim & 0x1ffu, (tb_prim >> 10) & 0x1ffu);"), "{}", t.hlsl);
 }
 
+/// The FSSM header's wave-size bit (u32[0xD4] bit 5) decides the wave size when the code has no
+/// wave64 marker: the same marker-free program is wave64 with the bit clear and wave32 with it set.
+#[test]
+fn mesh_wave_size_follows_the_fssm_header() {
+    let mut w = vec![];
+    w.extend(vop3(0x365, 0, [ic(-1), ic(0), 0]));
+    w.extend([sop1(3, M0, LIT), (1 << 12) | 2]);
+    w.push(sopp(0x10, 9));
+    w.extend([vop1(1, 9, LIT), 1 << 10]);
+    w.extend(exp(12, 0xf, false, [0, 0, 0, 0]));
+    w.extend(exp(20, 0x1, true, [9, 0, 0, 0]));
+    w.push(S_ENDPGM);
+    let mut header = vec![0u8; 0x100];
+    header[0..4].copy_from_slice(b"FSSM");
+    for (flags, lanes, wave) in [(0x00u8, "(min(gi & 63u, 32u) + 0x0u)", "s3 = (gi / 64u) << 24;"), (0x20, "((gi & 31u) + 0x0u)", "s3 = (gi / 32u) << 24;")] {
+        let mut ex = ms(&w, mesh_info(128, 2, 1, 1), vec![sig("SV_Position", 1, 3, 0, 0xf)]);
+        header[0xd4] = flags;
+        ex.fssm = header.clone();
+        let t = translate(&ex).expect("translate");
+        assert!(t.hlsl.contains(lanes) && t.hlsl.contains(wave), "flags {flags:#x}:\n{}", t.hlsl);
+    }
+}
+
 #[test]
 fn mesh_clip_distance_export_maps_to_pos1() {
     let mut w = vec![];

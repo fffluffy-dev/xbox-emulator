@@ -9,13 +9,25 @@ pub const EXP_PRIM: u32 = 20;
 pub const MS_LDS_DWORDS: usize = 7167;
 pub const AS_ABI_UNKNOWN: &str = "amplification shader: the console AS (xgs12_10 0xde6f0) gets s[0:1] = user-data block, s2 = mesh-args ring >> 8, s3 = payload ring >> 8 and gid.x offset by COMPUTE_START_X, and leaves through global memory stores into those rings; the translator has no global-store path and the per-entry ring addressing and the mesh shader's payload register are not decoded";
 
-pub fn wave_size(insns: &[Insn]) -> u32 {
+/// Guest wave size. The FSSM header states it (flags word u32[0xD4], bit 5: set = wave32,
+/// clear = wave64); code markers (v_mbcnt_hi, 64-bit saveexec / EXEC writes) only prove wave64
+/// when present. Header rule from the Leonida project (docs/design.md "Wave size", GPLv3+):
+/// 0 contradictions with code-proven wave32/wave64 instructions over the 26,503 shaders of the
+/// GTA VI package, where the marker scan alone misses 2,287 wave64 shaders (616 mesh). A marker
+/// still wins over a header that says wave32.
+pub fn wave_size(insns: &[Insn], fssm: &[u8]) -> u32 {
     let w64 = insns.iter().any(|i| {
         i.mnemonic == "v_mbcnt_hi_u32_b32"
             || i.mnemonic.ends_with("saveexec_b64")
             || (i.mnemonic.ends_with("_b64") && matches!(i.dst.first(), Some(Opnd::ExecLo)))
     });
-    if w64 { 64 } else { 32 }
+    if w64 {
+        return 64;
+    }
+    match crate::meta::fssm_wave32(fssm) {
+        Some(false) => 64,
+        _ => 32,
+    }
 }
 
 fn all_lanes(o: &Opnd) -> bool {
@@ -48,7 +60,7 @@ impl<'a> Emitter<'a> {
         if !all_lanes(&ins.src[0]) {
             return Err(format!("{} with a mask other than all lanes in a mesh shader at {:#x}", ins.mnemonic, ins.offset));
         }
-        let w = wave_size(&self.insns);
+        let w = wave_size(&self.insns, &self.ex.fssm);
         Ok(match (ins.mnemonic.as_str(), w) {
             ("v_mbcnt_lo_u32_b32", 64) => format!("(min(gi & 63u, 32u) + {b})"),
             ("v_mbcnt_lo_u32_b32", _) => format!("((gi & 31u) + {b})"),
@@ -65,7 +77,7 @@ impl<'a> Emitter<'a> {
         if written {
             return Ok(None);
         }
-        let w = wave_size(&self.insns);
+        let w = wave_size(&self.insns, &self.ex.fssm);
         Ok(Some(format!("(gid.x * {}u + (gi & {:#x}u))", self.ms_threads()?, !(w - 1))))
     }
 
@@ -220,7 +232,7 @@ impl<'a> Emitter<'a> {
             self.amp_ms_regs();
         }
         let _ = writeln!(h, "{}", self.reg_decls());
-        let w = wave_size(&self.insns);
+        let w = wave_size(&self.insns, &self.ex.fssm);
         let _ = writeln!(h, "    SOut o = (SOut)0; uint tb_prim = 0u;");
         let _ = writeln!(h, "    if (gi == 0u) tb_mscnt = 0u;");
         let _ = writeln!(h, "    GroupMemoryBarrierWithGroupSync();");
