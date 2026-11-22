@@ -5374,7 +5374,8 @@ impl<'a> Emitter<'a> {
                 Some(Opnd::Vgpr(n)) => *n,
                 _ => return Err("bad vdata".into()),
             };
-            self.wv(&Opnd::Vgpr(vd.wrapping_add(mimg_data_regs(ins) as u8)), "0u")?;
+            let st = u8::try_from(vd as u32 + mimg_data_regs(ins)).map_err(|_| format!("{}: TFE status register past v255", ins.mnemonic))?;
+            self.wv(&Opnd::Vgpr(st), "0u")?;
         }
         Ok(())
     }
