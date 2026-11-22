@@ -1,59 +1,90 @@
-# Xbox Emulator
+# fucking-frankenstein
 
-**Running the Xbox Series X|S library on PC. A continuation of [drycheetah84/TomBox](https://github.com/drycheetah84/TomBox).**
+**Xbox Series X|S and Xbox One (GDK) games on PC, stitched together from every open project that got part of the way there.**
 
-The runtime reimplements the console's platform layer (Xbox-flavoured Direct3D 12, precompiled RDNA2 shaders, unified-memory textures, system libraries) so dumped, already-decrypted Xbox Series X|S builds run as normal Windows processes. It is not tied to any single title. This repo tracks our continuation — new titles brought up, platform calls extended, shader stages unlocked.
+The body is [TomBox](https://github.com/drycheetah84/TomBox): a runtime that reimplements the console platform layer (Xbox-flavoured Direct3D 12, precompiled RDNA2 shaders, unified-memory textures, the console system libraries) so dumped, already-decrypted builds run as ordinary Windows processes. The other organs are grafted from projects that solved one piece better:
 
-Uses legally obtained, already-decrypted dumps. The runtime does no key extraction or package decryption.
+| Part | Donor | What it brings |
+|---|---|---|
+| Runtime, D3D12.x, console libraries, RDNA2 → HLSL/DXIL translator | [TomBox](https://github.com/drycheetah84/TomBox) (base `7e8064f`), [omonkeyz/xbox-emulator](https://github.com/omonkeyz/xbox-emulator) | Everything that already boots real titles |
+| Shaders without a root signature, bindless T# / S#, memory at the console GPU address | [Leonida](https://github.com/ItsNotRexed/Leonida) (GTA VI recompilation, GPL-3.0-or-later) | The resource model GTA VI's 26,503 shaders need (ported as *memory-descriptor mode*, see below) |
+| Ideas only (core is GPL-2.0-only, so no code) | [americas-recomp](https://github.com/realdody/americas-recomp) | Static-recompilation layout; MIT-licensed files only, per its REUSE.toml |
 
-**Source code:** the emulator's Rust workspace is in this repo: [`crates/`](crates/), [`tools/`](tools/) and `Cargo.toml`. It contains no game files, binaries or build output.
+Uses legally obtained, already-decrypted dumps of games you own. The project does no key extraction or package decryption and ships no game files.
 
-**Contributing:** pull requests are welcome, especially console library functions still marked missing in the [library map](docs/LIBRARY_MAP.md). See [CONTRIBUTING.md](CONTRIBUTING.md). Licensed GPL-3.0-or-later (see [LICENSE](LICENSE)). Releases before this change remain available under MIT OR Apache-2.0.
+**Source:** the Rust workspace is in [`crates/`](crates/), [`tools/`](tools/) and `Cargo.toml`. Licensed GPL-3.0-or-later ([LICENSE](LICENSE)); releases before the relicense remain available under MIT OR Apache-2.0. Contributions welcome, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## Status
+## Where it stands (2026-11-22)
 
 [![system functions](docs/img/badge-imports.svg)](docs/img/progress.svg)
 [![Direct3D 12.x methods](docs/img/badge-d3d12x.svg)](docs/img/progress.svg)
 [![RDNA2 instructions](docs/img/badge-instructions.svg)](docs/img/progress.svg)
-[![shaders translated](docs/img/badge-shaders.svg)](#tested-titles)
+[![shaders translated](docs/img/badge-shaders.svg)](#titles)
 [![shader stages](docs/img/badge-stages.svg)](docs/img/progress.svg)
-[![milestones](docs/img/badge-milestones.svg)](#milestones)
-[![titles examined](docs/img/badge-titles.svg)](#tested-titles)
+[![milestones](docs/img/badge-milestones.svg)](docs/MILESTONES.md)
+[![titles examined](docs/img/badge-titles.svg)](#titles)
 [![Xbox console libraries](docs/img/badge-console.svg)](docs/LIBRARY_MAP.md)
+
+| Area | State |
+|---|---|
+| Imported system functions (Fortnite EXE) | 671 / 671 covered |
+| Direct3D 12.x interface methods | 194 / 200 |
+| RDNA2 instructions verified | 768 / 781 |
+| Xbox console library exports | 2,132 / 2,155 |
+| Full shader sweep of the tested titles | 105,506 / 105,506 translate |
+| Shaders without a root signature (GTA VI mesh programs) | **New:** buffers *and* images / samplers translate in memory-descriptor mode; runtime side not wired yet |
+| Translator checked on real GPUs | **New:** GitHub Actions (Windows, WARP + DXC) and a Steam Deck (RDNA2, Proton / vkd3d-proton / RADV) |
+| Mesh / amplification stages | Translate; wave size now taken from the FSSM header |
+| Audio | Not working in titles |
+| Input | Not working in titles |
 
 [![progress map](docs/img/progress.svg)](docs/img/progress.svg)
 
-<sub>One square per item. The first four sections use upstream's definitions so the numbers stay comparable: green = done, amber = partial (a stub, a forwarder, or not verified to work), grey = not done — imported system functions of the Fortnite EXE, Direct3D 12.x interface methods, RDNA2 shader instructions the decoder knows, and the eight shader stages (mesh and amplification still grey). The fifth section is ours and covers Xbox console libraries only: the exports of the console OS DLLs (EmbeddedXvd of every analysed title, union, so the newest console OS sets the surface) that no same-named DLL in a PC's <code>C:\Windows\System32</code> exports, so console-only DLLs (d3d12_xs, xg_xs, xmem, AcpHal, chad, xapu, xcrdapi, the *legacy variants, ...) count in full and modified PC DLLs (kernel32, advapi32, mfplat, ...) only for their console-only exports, plus the GDK wrappers the emulator redirects; plain Windows DLLs (ntdll, msvcrt, ucrtbase, combase, ...) are not shown. Coloured implemented / forwarded / stub / missing; lighter squares are functions an analysed title imports. Per-title import coverage likewise counts only imports from console libraries. Generated by <code>tools/progress/gen.py</code>; per-function tables in <a href="docs/LIBRARY_MAP.md">docs/LIBRARY_MAP.md</a>, headline numbers in <a href="tools/progress/summary.json">tools/progress/summary.json</a>.</sub>
+<sub>Squares and badges are generated by <code>tools/progress/gen.py</code> (green done, amber partial, grey missing); per-function tables in <a href="docs/LIBRARY_MAP.md">docs/LIBRARY_MAP.md</a>, numbers in <a href="tools/progress/summary.json">tools/progress/summary.json</a>.</sub>
 
-## Milestones
-
-Counted live by `tools/progress/gen.py`; full table with evidence in [docs/MILESTONES.md](docs/MILESTONES.md).
-
-| Milestone | State |
-|---|---|
-| All imported system functions covered (671/671) | done |
-| Full title shader sweep translated (105,506/105,506) | done |
-| All Direct3D 12.x methods covered | in progress (map) |
-| All RDNA2 instructions verified | in progress (map) |
-| All shader stages (Mesh, Amplification) | in progress (map) |
-| All Xbox console libraries covered | in progress (map) |
-| Fortnite boots, first frames, login, hotfix, mode select, BR lobby | done (7 run milestones) |
-| 3D scene correct | not reached |
-| Keyboard / controller input | not reached |
-| Audio | not reached |
-| Gameplay | not reached |
-| A second title running | not reached |
-
-## Tested titles
+## Titles
 
 | Title | Build | Result |
 |---|---|---|
-| Fortnite (Chapter 2 Season 4) | 2.0.1461.7919 | Boots, logs in to a private server, reaches the lobby. 2D interface correct. 3D scene lit but the character material is wrong and bloom shows artifacts. No audio. Not playable. On this machine (2026-11-21): boots, first frames, window on the primary monitor, login complete, hotfix success, game-mode select, Battle Royale lobby (`UI.State.Athena.Frontend`). |
-| XDefiant | dump examined | **Not run.** Imports and console OS (10.0.22000) mapped in [docs/LIBRARY_MAP.md](docs/LIBRARY_MAP.md); new modules include XCurl, Bink2Scarlett, chad (XDsp*), xapu (XApu*). |
-| Grand Theft Auto VI | 1.0.2.1 | **Not run** (dump has no executable). Shader package examined: 26,503 shaders, plain compressed Xbox shader containers. Of a 4,000-shader sample all disassemble cleanly; ~⅓ of vertex shaders translate. Blockers: mesh shaders, shaders without root signatures. |
+| Fortnite (Chapter 2 Season 4) | 2.0.1461.7919 | Boots, logs in to a local backend, reaches the Battle Royale lobby. 2D interface correct; 3D scene lit but materials wrong, bloom artifacts. No audio, no input. Not playable. |
+| Trackmania | Xbox One build | Title menu draws at 144 fps. Open: xg_x HTILE / metadata planes, stencil-only MSAA views. |
+| Terraria | Xbox One build | Runs 60 s without crashing; no frame yet (textures get GPU VA 0, Unity waits on the upload). |
+| XDefiant | Series build | Runs about 140 s at 60 fps, frame black: aliased-VA render targets need shared backing. Parked. |
+| Minecraft | GDK build | Imports analysed and GDK slots verified; not brought up. |
+| Grand Theft Auto VI | 1.0.2.1 | **Not run: no executable exists in any dump.** Shader package examined (26,503 shaders). The blocker that stopped two thirds of them, resources bound without a root signature, now has a translator answer (memory-descriptor mode); the rest of the road is in the [roadmap](docs/ROADMAP.md). |
 
-## Our local state
+## What changed in the last round
 
+Each item is its own branch and pull request in this repo, with an issue describing the problem first.
+
+**Translator (tombox-xshader)**
+- Memory-descriptor mode for shaders with no root signature ([#24](https://github.com/fffluffy-dev/xbox-emulator/issues/24), [#25](https://github.com/fffluffy-dev/xbox-emulator/pull/25)). Ported from Leonida's runtime contract: s0–s31 come from a runtime constant buffer, memory is read at the console GPU address through windows, V# buffers are bounds-checked from the descriptor the shader loaded, and T# / S# are looked up by an FNV-1a key in a table the runtime keeps, then taken from `ResourceDescriptorHeap` / `SamplerDescriptorHeap` (SM 6.6). Unknown descriptors read a null view and are counted.
+- Round-mode emulation fixed for drivers that fold `(double)(float)x` to `x` (vkd3d-proton / RADV) ([#20](https://github.com/fffluffy-dev/xbox-emulator/issues/20), [#21](https://github.com/fffluffy-dev/xbox-emulator/pull/21)). Verified on the Steam Deck: 0 failures.
+- Mesh-shader wave size from the FSSM header: 616 wave64 programs were treated as wave32 ([#22](https://github.com/fffluffy-dev/xbox-emulator/issues/22), [#23](https://github.com/fffluffy-dev/xbox-emulator/pull/23)).
+- Vertex inputs placed from the FSSM input table, including merged VS (`MainForGS`) ([#15](https://github.com/fffluffy-dev/xbox-emulator/issues/15), [#16](https://github.com/fffluffy-dev/xbox-emulator/pull/16)).
+- GFX10 image atomics decode and honour GLC ([#5](https://github.com/fffluffy-dev/xbox-emulator/issues/5), [#6](https://github.com/fffluffy-dev/xbox-emulator/pull/6)); MIMG TFE status VGPR written ([#4](https://github.com/fffluffy-dev/xbox-emulator/issues/4), [#2](https://github.com/fffluffy-dev/xbox-emulator/pull/2)); store/atomic data registers count as entry inputs ([#11](https://github.com/fffluffy-dev/xbox-emulator/issues/11), [#12](https://github.com/fffluffy-dev/xbox-emulator/pull/12)).
+- Fuzzing: 300,000 random programs, 0 panics after two fixes ([#9](https://github.com/fffluffy-dev/xbox-emulator/issues/9), [#10](https://github.com/fffluffy-dev/xbox-emulator/pull/10)).
+- GCN lowering: SMRD `s_memtime` / `s_dcache_inv` mapping and CI `buffer_wbinvl1_vol` ([#7](https://github.com/fffluffy-dev/xbox-emulator/issues/7), [#8](https://github.com/fffluffy-dev/xbox-emulator/pull/8)).
+
+**Testing without the developer's PC**
+- CI on GitHub Actions: Linux portable tests, Windows translator tests with DXC and D3D12 (WARP), the workspace, d3d12_xs hardware tests and a runtime bundle ([#13](https://github.com/fffluffy-dev/xbox-emulator/issues/13)).
+- The portable tests build on Linux ([#3](https://github.com/fffluffy-dev/xbox-emulator/issues/3), [#1](https://github.com/fffluffy-dev/xbox-emulator/pull/1)).
+- Steam Deck as a real RDNA2 test machine: 81 / 89 GPU tests passed on the first run; the rest were test assumptions or driver folds, fixed in [#19](https://github.com/fffluffy-dev/xbox-emulator/pull/19) and [#21](https://github.com/fffluffy-dev/xbox-emulator/pull/21) ([#18](https://github.com/fffluffy-dev/xbox-emulator/issues/18)).
+
+## Roadmap
+
+The full plan, with what blocks each step, is in **[docs/ROADMAP.md](docs/ROADMAP.md)**. In short:
+
+1. **Land the open pull requests** and keep CI green.
+2. **Finish the GTA VI resource model:** the d3d12_xs runtime fills the user data, maps memory windows and keeps the T# / S# table (memory-descriptor step 3).
+3. **Make a second title playable:** Trackmania past the menu, Terraria to its first frame, XDefiant out of the black frame, with audio and input.
+4. **Fortnite in game:** correct 3D materials, audio, controller and keyboard.
+5. **GTA VI:** everything that can be done without an executable now; boot when one exists.
+
+## Documents
+
+- [docs/ROADMAP.md](docs/ROADMAP.md) — the plan
+- [docs/MILESTONES.md](docs/MILESTONES.md) — milestones with evidence (generated)
 - [docs/DEVELOPMENT_LOG.md](docs/DEVELOPMENT_LOG.md) — chronological log
 - [docs/BLOCKERS.md](docs/BLOCKERS.md) — standing walls
 - [docs/LIBRARY_MAP.md](docs/LIBRARY_MAP.md) — per-library, per-function status (generated)
@@ -61,4 +92,4 @@ Counted live by `tools/progress/gen.py`; full table with evidence in [docs/MILES
 
 ## Credit
 
-Upstream: [drycheetah84/TomBox](https://github.com/drycheetah84/TomBox) (base commit `7e8064f`). The map and badges here are generated in this repo by `tools/progress/gen.py`, which keeps upstream's metric definitions and style for the first four sections.
+[drycheetah84/TomBox](https://github.com/drycheetah84/TomBox) (base commit `7e8064f`) and [omonkeyz/xbox-emulator](https://github.com/omonkeyz/xbox-emulator) for the runtime; [ItsNotRexed/Leonida](https://github.com/ItsNotRexed/Leonida) for the GTA VI resource model ported into the translator. The progress map keeps TomBox's metric definitions so its numbers stay comparable.

@@ -172,7 +172,7 @@ fn create_window(client_w: i32, client_h: i32) -> usize {
     let (tx, rx) = std::sync::mpsc::channel::<usize>();
     std::thread::spawn(move || unsafe {
         let class = wide("XboxEmulatorHostWindow");
-        let title = wide("Xbox Emulator");
+        let title = wide("fucking-frankenstein");
         let inst = GetModuleHandleW(core::ptr::null());
         let wc = WndClassExW {
             size: core::mem::size_of::<WndClassExW>() as u32,
