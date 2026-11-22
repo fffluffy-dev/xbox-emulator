@@ -179,6 +179,137 @@ pub fn main() {
         }
         println!("{line}");
     }
-    println!("{}", if bad == 0 { "fp_mode_probe: all IEEE-conformant" } else { "fp_mode_probe: non-conformant results above" });
+    bad += probe_round_mode(&mut g);
+    bad += probe_wave_shuffle(&mut g);
+    println!("{}", if bad == 0 { "fp_mode_probe: all conformant" } else { "fp_mode_probe: non-conformant results above" });
     std::process::exit(if bad == 0 { 0 } else { 1 });
+}
+
+/// Run `code` (root signature "UAV(u0)") once with `input` in a 512-byte buffer and
+/// return the whole buffer.
+unsafe fn run_raw(g: &mut Gpu, code: &[u8], input: &[u32]) -> Result<Vec<u32>, String> {
+    let total = 512u64;
+    let mut rs: *mut c_void = core::ptr::null_mut();
+    let hr = vcall!(g.device, 16, fn(u32, *const u8, usize, *const d3d::Guid, *mut *mut c_void) -> i32, 0, code.as_ptr(), code.len(), &d3d::IID_ROOTSIG, &mut rs);
+    if hr < 0 {
+        return Err(format!("CreateRootSignature {hr:#x}"));
+    }
+    let mut d = [0u8; 56];
+    d[0..8].copy_from_slice(&(rs as u64).to_le_bytes());
+    d[8..16].copy_from_slice(&(code.as_ptr() as u64).to_le_bytes());
+    d[16..24].copy_from_slice(&(code.len() as u64).to_le_bytes());
+    let mut pso: *mut c_void = core::ptr::null_mut();
+    let hr = vcall!(g.device, 11, fn(*const u8, *const d3d::Guid, *mut *mut c_void) -> i32, d.as_ptr(), &d3d::IID_PSO, &mut pso);
+    if hr < 0 {
+        return Err(format!("CreateComputePipelineState {hr:#x}"));
+    }
+    let buf = g.buffer(total, 1, d3d::COPY_DEST, true)?;
+    let up = g.buffer(total, 2, d3d::GENERIC_READ, false)?;
+    let rb = g.buffer(total, 3, d3d::COPY_DEST, false)?;
+    let mut bytes: Vec<u8> = input.iter().flat_map(|w| w.to_le_bytes()).collect();
+    bytes.resize(total as usize, 0);
+    Gpu::map_write(up, &bytes);
+    g.begin();
+    let l = g.list;
+    vcall!(l, 15, fn(*mut c_void, u64, *mut c_void, u64, u64) -> (), buf, 0, up, 0, total);
+    g.barrier(buf, d3d::COPY_DEST, 8);
+    vcall!(l, 29, fn(*mut c_void) -> (), rs);
+    vcall!(l, 25, fn(*mut c_void) -> (), pso);
+    vcall!(l, 41, fn(u32, u64) -> (), 0, Gpu::gpu_va(buf));
+    vcall!(l, 14, fn(u32, u32, u32) -> (), 1, 1, 1);
+    g.barrier(buf, 8, d3d::COPY_SOURCE);
+    vcall!(l, 15, fn(*mut c_void, u64, *mut c_void, u64, u64) -> (), rb, 0, buf, 0, total);
+    g.submit()?;
+    let out = Gpu::map_read(rb, total as usize).ok_or("map")?;
+    for k in [pso, rs, buf, up, rb] {
+        d3d::release(k);
+    }
+    Ok(out.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+}
+
+/// The translator's round-mode helpers, taken verbatim from its source (hlsl/mode.rs and the
+/// common prelude in hlsl.rs) so the probe runs exactly what translated shaders run.
+fn mode_helpers() -> String {
+    let mode = include_str!("../../src/hlsl/mode.rs");
+    let common = include_str!("../../src/hlsl.rs");
+    let want = ["bool tb_nan(", "float tb_nup(", "float tb_ndn(", "float tb_rfix(", "double tb_res2(", "float tb_m_add(", "float tb_m_mul("];
+    let mut out = String::new();
+    for w in want {
+        let line = mode.lines().chain(common.lines()).find(|l| l.starts_with(w)).unwrap_or_else(|| panic!("helper {w} not found in the translator source"));
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// tb_m_add / tb_m_mul with round-toward-+inf (m = 1) on runtime inputs; prints r, e and q so
+/// the step where the mode is lost is visible.
+fn probe_round_mode(g: &mut Gpu) -> usize {
+    let src = format!(
+        "RWByteAddressBuffer io : register(u0);\n{}[RootSignature(\"UAV(u0)\")]\n[numthreads(1, 1, 1)]\nvoid main() {{\n    uint4 x = io.Load4(0);\n    float a = asfloat(x.x), b = asfloat(x.y), c = asfloat(x.z); uint m = x.w;\n    precise float r = a + b; precise double e = tb_res2((double)a, (double)b, r); float q = tb_m_add(a, b, m);\n    uint el, eh; asuint(e, el, eh);\n    io.Store4(64, uint4(asuint(r), el, eh, asuint(q)));\n    precise double p = (double)c * (double)c; precise float r2 = (float)p; precise double e2 = p - (double)r2; float q2 = tb_m_mul(c, c, m);\n    uint fl, fh; asuint(e2, fl, fh);\n    io.Store4(80, uint4(asuint(r2), fl, fh, asuint(q2)));\n}}\n",
+        mode_helpers()
+    );
+    let mut bad = 0;
+    let code = match dxc::compile(&src, "cs_6_2") {
+        Ok(c) => c,
+        Err(e) => {
+            println!("round-mode helpers: compile failed: {}", e.lines().next().unwrap_or(""));
+            return 1;
+        }
+    };
+    // a = 1 + 2^-22, b = 2^-25: exact sum 1 + 2^-22 + 2^-25, RTE 0x3f800002, RTP 0x3f800003, e = +2^-25.
+    // c = 1 + 2^-23: c*c = 1 + 2^-22 + 2^-46, RTE 0x3f800002, RTP 0x3f800003, e = +2^-46.
+    match unsafe { run_raw(g, &code, &[0x3f80_0002, 0x3300_0000, 0x3f80_0001, 1]) } {
+        Ok(o) => {
+            let show = |name: &str, base: usize, e_want: u64| {
+                let (r, e, q) = (o[base], (o[base + 2] as u64) << 32 | o[base + 1] as u64, o[base + 3]);
+                let ok = r == 0x3f80_0002 && e == e_want && q == 0x3f80_0003;
+                println!("round-mode {name}: r={r:#010x} (want 0x3f800002) e={e:#018x} (want {e_want:#018x}) q={q:#010x} (want 0x3f800003) {}", if ok { "ok" } else { "BAD" });
+                ok
+            };
+            if !show("tb_m_add RTP", 16, 0x3e60_0000_0000_0000) {
+                bad += 1;
+            }
+            if !show("tb_m_mul RTP", 20, 0x3d10_0000_0000_0000) {
+                bad += 1;
+            }
+        }
+        Err(e) => {
+            println!("round-mode helpers: run failed: {e}");
+            bad += 1;
+        }
+    }
+    bad
+}
+
+/// WaveReadLaneAt with a per-lane (non-uniform) index must shuffle (HLSL spec): lane l reads
+/// lane (l + 1) % width.
+fn probe_wave_shuffle(g: &mut Gpu) -> usize {
+    let src = "RWByteAddressBuffer io : register(u0);\n[RootSignature(\"UAV(u0)\")]\n[numthreads(32, 1, 1)]\nvoid main(uint3 t : SV_GroupThreadID) {\n    uint l = WaveGetLaneIndex(); uint w = WaveGetLaneCount();\n    uint v = l * 3u + 7u + io.Load(0);\n    uint s = WaveReadLaneAt(v, (l + 1u) % w);\n    io.Store(64 + t.x * 4u, s);\n    if (t.x == 0u) io.Store(32, w);\n}\n";
+    let code = match dxc::compile(src, "cs_6_0") {
+        Ok(c) => c,
+        Err(e) => {
+            println!("wave shuffle: compile failed: {}", e.lines().next().unwrap_or(""));
+            return 1;
+        }
+    };
+    match unsafe { run_raw(g, &code, &[0]) } {
+        Ok(o) => {
+            let w = o[8].max(1);
+            let got: Vec<u32> = (0..32).map(|t| o[16 + t]).collect();
+            let want: Vec<u32> = (0..32u32).map(|t| ((t % w + 1) % w + t / w * w) * 3 + 7).collect();
+            let own = (0..32u32).all(|t| got[t as usize] == t * 3 + 7);
+            if got == want {
+                println!("wave shuffle (WaveReadLaneAt, non-uniform index): wave {w}, ok");
+                0
+            } else {
+                println!("wave shuffle (WaveReadLaneAt, non-uniform index): wave {w}, BAD{} got {:?} want {:?}", if own { " (every lane read its own value)" } else { "" }, &got[..8], &want[..8]);
+                1
+            }
+        }
+        Err(e) => {
+            println!("wave shuffle: run failed: {e}");
+            1
+        }
+    }
 }
