@@ -62,6 +62,7 @@ fn shader(words: &[u32], root: Option<RootSig>) -> ShaderExtract {
         isa,
         isa_offset_in_fssm: 0,
         isa_preamble: [0; 4],
+        psv_numthreads: None,
         has_input_sig: true,
         has_output_sig: true,
         has_psv0: false,
@@ -176,10 +177,10 @@ fn cmpx_writes_exec_only() {
         ("v_cmpx_gt_i32", vec![vopc(0x94, v(1), 2)], vec!["(asint(v1) > asint(v2))"]),
         ("v_cmpx_lt_f32", vec![vopc(0x11, v(1), 2)], vec!["(asfloat(v1) < asfloat(v2))"]),
         ("v_cmpx_lg_f32", vec![vopc(0x15, v(1), 2)], vec!["((asfloat(v1) < asfloat(v2)) || (asfloat(v1) > asfloat(v2)))"]),
-        ("v_cmpx_nlg_f32", vec![vopc(0x1a, v(1), 2)], vec!["(!((asfloat(v1) < asfloat(v2)) || (asfloat(v1) > asfloat(v2))))"]),
-        ("v_cmpx_neq_f32", vec![vopc(0x1d, v(1), 2)], vec!["(!(asfloat(v1) == asfloat(v2)))"]),
+        ("v_cmpx_nlg_f32", vec![vopc(0x1a, v(1), 2)], vec!["|| (asfloat(v1) == asfloat(v2)))"]),
+        ("v_cmpx_neq_f32", vec![vopc(0x1d, v(1), 2)], vec!["|| ((asfloat(v1) < asfloat(v2)) || (asfloat(v1) > asfloat(v2))))"]),
         ("v_cmpx_gt_f16", vec![vopc(0xdc, v(1), 2)], vec!["(f16tof32((v1) & 0xffffu) > f16tof32((v2) & 0xffffu))"]),
-        ("v_cmpx_nlt_f16", vec![vopc(0xfe, v(1), 2)], vec!["(!(f16tof32((v1) & 0xffffu) < f16tof32((v2) & 0xffffu)))"]),
+        ("v_cmpx_nlt_f16", vec![vopc(0xfe, v(1), 2)], vec!["|| (f16tof32((v1) & 0xffffu) >= f16tof32((v2) & 0xffffu)))"]),
         ("v_cmpx_gt_f32 vop3 abs/neg", vop3(0x14, 0, [v(1), v(2), 0], 1, 2).to_vec(), vec!["(abs(asfloat(v1)) > (-asfloat(v2)))"]),
         ("v_cmpx_lt_i16", vec![vopc(0x99, v(1), 2)], vec!["((asint(((v1) & 0xffffu) << 16) >> 16) < (asint(((v2) & 0xffffu) << 16) >> 16))"]),
         ("v_cmpx_ge_u16", vec![vopc(0xbe, v(1), 2)], vec!["(((v1) & 0xffffu) >= ((v2) & 0xffffu))"]),
@@ -290,10 +291,10 @@ fn second_batch_vector_ops() {
         ("v_frexp_mant_f32", vec![vop1(0x40, 0, v(1))], vec!["0x3f000000u"]),
         ("v_frexp_exp_i16_f16", vec![vop1(0x5a, 0, v(1))], vec!["- 14u"]),
         ("v_frexp_mant_f16", vec![vop1(0x59, 0, v(1))], vec!["0x3800u"]),
-        ("v_log_f16", vec![vop1(0x57, 0, v(1))], vec!["tb_f2h(log2(f16tof32((v1) & 0xffffu)))"]),
-        ("v_exp_f16", vec![vop1(0x58, 0, v(1))], vec!["exp2("]),
-        ("v_sin_f16", vec![vop1(0x60, 0, v(1))], vec!["sin(f16tof32((v1) & 0xffffu) * 6.28318530718)"]),
-        ("v_cos_f16", vec![vop1(0x61, 0, v(1))], vec!["cos("]),
+        ("v_log_f16", vec![vop1(0x57, 0, v(1))], vec!["tb_t16(3u, ((v1) & 0xffffu))"]),
+        ("v_exp_f16", vec![vop1(0x58, 0, v(1))], vec!["tb_t16(4u, "]),
+        ("v_sin_f16", vec![vop1(0x60, 0, v(1))], vec!["tb_t16(5u, ((v1) & 0xffffu))"]),
+        ("v_cos_f16", vec![vop1(0x61, 0, v(1))], vec!["tb_t16(6u, "]),
         ("v_sat_pk_u8_i16", vec![vop1(0x62, 0, v(3))], vec!["clamp(asint(v3) >> 16, 0, 255) << 8"]),
         ("v_cvt_norm_i16_f16", vec![vop1(0x63, 0, v(1))], vec!["32767u)"]),
         ("v_cvt_norm_u16_f16", vec![vop1(0x64, 0, v(1))], vec!["65535u)"]),
@@ -543,7 +544,7 @@ fn hardware_register_access() {
         ("s_getreg_b32 MODE", vec![sopk(0x12, 4, 0xf801), vop1(1, 0, 4)], vec!["static uint tb_hw1 = 0xf0u;", "tb_hw1"]),
         ("s_setreg_b32 MODE[7:4]", vec![sopk(0x13, 0, 0x1901), sopk(0x12, 4, 0xf801), vop1(1, 0, 4)], vec!["tb_hw1 = (tb_hw1 & 0xffffff0fu) | ((s0 << 4u) & 0xf0u);"]),
         ("s_setreg_imm32_b32", vec![sopk(0x15, 0, 0x1901), 0x0000_0005, sopk(0x12, 4, 0xf801), vop1(1, 0, 4)], vec!["(0x5u << 4u)"]),
-        ("s_getreg_b32 STATUS", vec![sopk(0x12, 4, 0xf802), vop1(1, 0, 4)], vec!["WaveActiveAnyTrue("]),
+        ("s_getreg_b32 STATUS", vec![sopk(0x12, 4, 0xf802), vop1(1, 0, 4)], vec!["WaveActiveBallot((exec_lo & 1u) != 0u)", "WaveActiveBallot((vcc_lo & 1u) != 0u)"]),
         ("s_getreg_b32 SHADER_CYCLES", vec![sopk(0x12, 4, 0x981d), vop1(1, 0, 4)], vec!["tb_hw29 = (tb_hw29 + 4u) & 0xfffffu;"]),
         ("s_sleep advances SHADER_CYCLES", vec![0xbf8e_0002, sopk(0x12, 4, 0x981d), vop1(1, 0, 4)], vec!["tb_hw29 = (tb_hw29 + 128u) & 0xfffffu;"]),
         ("s_setprio sets STATUS.USER_PRIO", vec![0xbf8f_0003, sopk(0x12, 4, 0xf802), vop1(1, 0, 4)], vec!["tb_hw2 = (tb_hw2 & ~0x18u) | 0x18u;", "(tb_hw2 & 0x18u)"]),
@@ -552,6 +553,44 @@ fn hardware_register_access() {
     for (label, body, expect) in cases {
         check(label, &program(&body), None, &expect);
     }
+}
+
+#[test]
+fn lane_numbering_follows_guest_wave() {
+    let readlane = vop3(0x360, 4, [v(1), 2, 0], 0, 0);
+    let writelane = vop3(0x361, 5, [3, 2, 0], 0, 0);
+    let dpp = [vop1(1, 6, 250), 1 | (0x111 << 8) | (0xf << 24) | (0x2 << 28)];
+    let body = |wave64: bool| {
+        let mut b = if wave64 { vec![sop1(4, 126, 0xc1)] } else { vec![] };
+        b.extend_from_slice(&readlane);
+        b.extend_from_slice(&writelane);
+        b.extend_from_slice(&dpp);
+        b.extend_from_slice(&[sopk(0x12, 7, 0xf802), vop1(1, 0, 4), vop1(1, 1, v(5)), vop1(1, 2, v(6)), vop1(1, 3, 7)]);
+        program(&b)
+    };
+    assert_eq!(mnemonic(&readlane).0, "v_readlane_b32");
+    assert_eq!(mnemonic(&writelane).0, "v_writelane_b32");
+    check(
+        "wave32 lanes",
+        &body(false),
+        None,
+        &[
+            "WaveReadLaneAt(v1, ((WaveGetLaneIndex() & ~31u) | ((s2) & 31u)))",
+            "if (WaveGetLaneIndex() == ((WaveGetLaneIndex() & ~31u) | ((s2) & 31u))) v5 = t",
+            "(0x2u >> ((t",
+            "l >> 4) & 1u)) & 1u) != 0u",
+            "WaveActiveBallot((exec_lo & 1u) != 0u)",
+            "WaveGetLaneIndex() >> 5;",
+        ],
+    );
+    check(
+        "wave64 lanes",
+        &body(true),
+        None,
+        &["WaveReadLaneAt(v1, ((s2) & 31u))", "if (WaveGetLaneIndex() == ((s2) & 31u)) v5 = t", "(0x2u >> (t", "l >> 4)) & 1u) != 0u", "WaveActiveAnyTrue((exec_lo & 1u) != 0u)"],
+    );
+    let w64 = translate(&shader(&body(true), None)).expect("wave64 translates").hlsl;
+    assert!(!w64.contains("& ~31u") && !w64.contains("WaveActiveBallot"), "wave64 lowering changed:\n{w64}");
 }
 
 #[test]
@@ -608,7 +647,7 @@ fn image_atomic_64bit_forms_are_refused() {
     for (op, dmask) in [(0x11, 3), (0x10, 0xf)] {
         let body = [0xf40c_0004, 0xfa00_0000, img_atomic(op, dmask, true), 0x0000_0401, vop1(1, 0, v(4))];
         let e = translate(&shader(&program(&body), root())).err().unwrap_or_else(|| panic!("op {op:#x} translated"));
-        assert!(e.contains("only the 32-bit form"), "{e}");
+        assert!(e.contains("only 32-bit image atomics"), "{e}");
     }
 }
 

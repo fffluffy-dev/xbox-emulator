@@ -28,9 +28,9 @@ Uses legally obtained, already-decrypted dumps of games you own. The project doe
 | Area | State |
 |---|---|
 | Imported system functions (Fortnite EXE) | 671 / 671 covered |
-| Direct3D 12.x interface methods | 194 / 200 |
-| RDNA2 instructions verified | 768 / 781 |
-| Xbox console library exports | 2,132 / 2,155 |
+| Direct3D 12.x interface methods | 192 / 200 (8 partial: Device 29, 44; CommandList 64, 70, 74, 85, 86, 101) |
+| RDNA2 instructions verified | 787 / 794 |
+| Xbox console library exports | 2,145 / 2,155 |
 | Full shader sweep of the tested titles | 105,506 / 105,506 translate |
 | Shaders without a root signature (GTA VI mesh programs) | **New:** buffers *and* images / samplers translate in memory-descriptor mode; runtime side not wired yet |
 | Translator checked on real GPUs | **New:** GitHub Actions (Windows, WARP + DXC) and a Steam Deck (RDNA2, Proton / vkd3d-proton / RADV) |
@@ -92,4 +92,4 @@ The full plan, with what blocks each step, is in **[docs/ROADMAP.md](docs/ROADMA
 
 ## Credit
 
-[drycheetah84/TomBox](https://github.com/drycheetah84/TomBox) (base commit `7e8064f`) and [omonkeyz/xbox-emulator](https://github.com/omonkeyz/xbox-emulator) for the runtime; [ItsNotRexed/Leonida](https://github.com/ItsNotRexed/Leonida) for the GTA VI resource model ported into the translator. The progress map keeps TomBox's metric definitions so its numbers stay comparable.
+[drycheetah84/TomBox](https://github.com/drycheetah84/TomBox) (base commit `7e8064f`) and [omonkeyz/xbox-emulator](https://github.com/omonkeyz/xbox-emulator) for the runtime (synced with its `main` at `1e77fcc`, 2026-11-22, including its contributors' work up to PR #169); [ItsNotRexed/Leonida](https://github.com/ItsNotRexed/Leonida) for the GTA VI resource model ported into the translator. The progress map keeps TomBox's metric definitions so its numbers stay comparable.

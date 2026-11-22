@@ -311,6 +311,11 @@ pub fn local_span(va: u64, need: u64, reservation: Option<(u64, u64)>) -> (u64, 
     (lo, (lo + need.max(LOCAL_WINDOW)).min(end).max(hi_min))
 }
 
+pub fn oversize_span(va: u64, pc_size: u64, xbox_size: u64) -> Option<(u64, u64)> {
+    let title = round_up(xbox_size, PLACEMENT_ALIGN);
+    (xbox_size != 0 && pc_size > title).then(|| (va, va + title))
+}
+
 fn reservation(va: u64) -> Option<(u64, u64)> {
     let first = query(va)?;
     if first.state == MEM_FREE {
@@ -341,6 +346,44 @@ unsafe fn allocation_info(real: *mut c_void, desc: &[u8; 0x38]) -> (u64, u64) {
     let mut r = [0u64; 2];
     unsafe { vcall!(real, 25, fn(*mut u64, u32, u32, *const u8) -> *mut u64, r.as_mut_ptr(), 0, 1, desc.as_ptr()) };
     (r[0], r[1])
+}
+
+fn heap_properties(desc: &[u64; 6]) -> [u32; 5] {
+    let b: Vec<u8> = desc.iter().flat_map(|w| w.to_le_bytes()).collect();
+    core::array::from_fn(|i| u32::from_le_bytes(b[8 + i * 4..12 + i * 4].try_into().unwrap()))
+}
+
+pub(crate) unsafe fn committed_when_too_big(
+    real: *mut c_void,
+    heap: *mut c_void,
+    offset: u64,
+    desc: &[u8; 0x38],
+    init_state: u32,
+    pclear: *const c_void,
+    ppv: *mut *mut c_void,
+) -> Option<i32> {
+    if heap.is_null() || ppv.is_null() || u32::from_le_bytes(desc[0..4].try_into().unwrap()) < 2 {
+        return None;
+    }
+    let (pc_size, _) = unsafe { allocation_info(real, desc) };
+    let mut hd = [0u64; 6];
+    unsafe { vcall!(heap, 8, fn(*mut u64) -> *mut u64, hd.as_mut_ptr()) };
+    let heap_bytes = hd[0];
+    if pc_size == u64::MAX || pc_size == 0 || offset.saturating_add(pc_size) <= heap_bytes {
+        return None;
+    }
+    let props = heap_properties(&hd);
+    let hr = unsafe {
+        vcall!(real, 27, fn(*const u32, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32,
+            props.as_ptr(), 0, desc.as_ptr(), init_state, pclear, &IID_RESOURCE, ppv)
+    };
+    static N: AtomicUsize = AtomicUsize::new(0);
+    if hr < 0 || N.fetch_add(1, Ordering::Relaxed) < 8 {
+        record("d3d12_xs", "CreatePlacedResource", &format!(
+            "texture needs {pc_size:#x} bytes on PC but the title heap has {heap_bytes:#x} at offset {offset:#x} (console size); created committed on heap type {} instead, not aliased with the title heap -> hr={hr:#010x}",
+            props[0]));
+    }
+    Some(hr)
 }
 
 unsafe fn open_title_heap(real: *mut c_void, base: u64) -> Option<(*mut c_void, u64)> {
@@ -533,10 +576,19 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
             if samples <= 1 {
                 unsafe { migrate_shadow(real, sp, va, size) };
             }
-            let key = match sp.find(Kind::Local, va, size, align) {
-                Some(k) if samples > 1 && !crate::msaa_place::capable(sp.get(k).heap) => None,
-                Some(k) => Some((k, false)),
-                None => {
+            let private = if dim >= 2 { oversize_span(va, size, xbox_size) } else { None };
+            let key = match (private, sp.find(Kind::Local, va, size, align)) {
+                (Some((lo, hi)), _) => unsafe { create_local_heap(real, size, samples > 1) }.map(|h| {
+                    STATS.heaps.fetch_add(1, Ordering::Relaxed);
+                    static N: AtomicUsize = AtomicUsize::new(0);
+                    if N.fetch_add(1, Ordering::Relaxed) < 16 {
+                        record("d3d12_xs", "alias", &format!("va={va:#x} PC texture needs {size:#x} but the title layout is {xbox_size:#x}: own heap, title VA range [{lo:#x}, {hi:#x}) only, so later placements after it never share its PC tail"));
+                    }
+                    (sp.insert(Span { lo, hi, kind: Kind::Local, heap: h as usize, retired: false, live: HashSet::new() }), true)
+                }),
+                (None, Some(k)) if samples > 1 && !crate::msaa_place::capable(sp.get(k).heap) => None,
+                (None, Some(k)) => Some((k, false)),
+                (None, None) => {
                     let (lo, hi) = local_span(va, size.max(xbox_size), reservation(va));
                     let fits = crate::msaa_place::span_fits(samples, va, lo, align);
                     if fits { unsafe { create_local_heap(real, hi - lo, samples > 1) } } else { None }.map(|h| {
@@ -705,6 +757,47 @@ mod tests {
         d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
         d[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
         d
+    }
+
+    #[test]
+    fn placed_texture_that_outgrows_its_heap_becomes_committed() {
+        const BC1_UNORM: u32 = 71;
+        const HEAP_ALLOW_ONLY_NON_RT_DS_TEXTURES: u32 = 0x44;
+        unsafe {
+            let dev = device();
+            let desc = tex_desc(4096, 4096, BC1_UNORM, 0);
+            let (pc_size, _) = allocation_info(dev, &desc);
+            assert!(pc_size > PLACEMENT_ALIGN && pc_size != u64::MAX);
+            let mk_heap = |size: u64| {
+                let mut hd = [0u8; 48];
+                hd[0..8].copy_from_slice(&size.to_le_bytes());
+                hd[8..12].copy_from_slice(&1u32.to_le_bytes());
+                hd[40..44].copy_from_slice(&HEAP_ALLOW_ONLY_NON_RT_DS_TEXTURES.to_le_bytes());
+                let mut h: *mut c_void = core::ptr::null_mut();
+                let hr = vcall!(dev, 28, fn(*const u8, *const Guid, *mut *mut c_void) -> i32, hd.as_ptr(), &IID_HEAP, &mut h);
+                assert!(hr >= 0 && !h.is_null(), "CreateHeap hr={hr:#010x}");
+                h
+            };
+            let release = |o: *mut c_void| {
+                vcall!(o, 2, fn() -> u32);
+            };
+
+            let small = mk_heap(pc_size - PLACEMENT_ALIGN);
+            let mut res: *mut c_void = core::ptr::null_mut();
+            let hr = committed_when_too_big(dev, small, 0, &desc, 0, core::ptr::null(), &mut res).expect("texture does not fit");
+            assert!(hr >= 0 && !res.is_null(), "committed fallback hr={hr:#010x}");
+            release(res);
+
+            let big = mk_heap(pc_size);
+            let mut none: *mut c_void = core::ptr::null_mut();
+            assert!(committed_when_too_big(dev, big, 0, &desc, 0, core::ptr::null(), &mut none).is_none());
+            assert!(none.is_null());
+
+            assert!(committed_when_too_big(dev, small, 0, &buf_desc(0x1000, 0), 0, core::ptr::null(), &mut none).is_none());
+            release(small);
+            release(big);
+            release(dev);
+        }
     }
 
     struct Gpu {
@@ -876,6 +969,68 @@ mod tests {
             create_placed_x(dev, va + 0x100_0000, &other, 0x2_0000, 0x4, core::ptr::null(), &mut d).expect("later placement");
             assert_eq!(spans_starting_at(va), 0);
             vcall!(d, 2, fn() -> u32);
+        }
+    }
+
+    #[test]
+    fn placement_uses_the_layout_the_title_was_told() {
+        let mut depth = tex_desc(1920, 1080, 19, 0x2);
+        depth[0x24..0x28].copy_from_slice(&2u32.to_le_bytes());
+        let xg = |_: &[u8]| -> Result<(u64, u64), i32> { Ok((0x13e_c000, 0x2000)) };
+        assert_eq!(crate::device_wrap::title_layout_size_with(&depth, Some(&xg)), 0x13e_c000);
+        assert_eq!(crate::device_wrap::title_layout_size_with(&depth, None), 0x1fe_0000);
+        let pc = 0x1fe_0000u64;
+        let told = crate::device_wrap::title_layout_size_with(&depth, Some(&xg));
+        assert_eq!(oversize_span(0x64f9_0000, pc, told), Some((0x64f9_0000, 0x6638_0000)));
+        assert_eq!(oversize_span(0x64f9_0000, pc, crate::device_wrap::title_layout_size_with(&depth, None)), None);
+    }
+
+    #[test]
+    fn oversize_span_only_when_the_pc_layout_outgrows_the_title_layout() {
+        assert_eq!(oversize_span(0x64f9_0000, 0x1fe_0000, 0x13e_c000), Some((0x64f9_0000, 0x64f9_0000 + 0x13f_0000)));
+        assert_eq!(oversize_span(0x64f9_0000, 0x13f_0000, 0x13e_c000), None);
+        assert_eq!(oversize_span(0x64f9_0000, 0x1fe_0000, 0x1fe_0000), None);
+        assert_eq!(oversize_span(0x64f9_0000, 0x1fe_0000, 0), None);
+    }
+
+    #[test]
+    fn msaa_depth_with_a_larger_pc_layout_never_overlaps_the_next_title_placement() {
+        unsafe {
+            let dev = device();
+            let r = VirtualAlloc(core::ptr::null_mut(), 0x400_0000, 0x2000, 0x01) as u64;
+            assert!(r != 0);
+            let small = tex_desc(256, 256, 28, 0x1);
+            let mut first: *mut c_void = core::ptr::null_mut();
+            let m0 = create_placed_x(dev, r, &small, 0x4_0000, 0x4, core::ptr::null(), &mut first).expect("first placement opens the reservation-wide span");
+            assert_eq!(m0.kind, Kind::Local);
+            let mut depth = tex_desc(1920, 1080, 19, 0x2);
+            depth[0x24..0x28].copy_from_slice(&2u32.to_le_bytes());
+            let pc = allocation_info(dev, &depth);
+            let console = 0x13e_c000u64;
+            assert!(pc.0 > round_up(console, PLACEMENT_ALIGN), "this adapter's R32G8X24 2x layout {:#x} is not larger than the console layout", pc.0);
+            let dva = r + 0x40_0000;
+            let mut clear = [0u8; 0x18];
+            clear[0..4].copy_from_slice(&20u32.to_le_bytes());
+            clear[4..8].copy_from_slice(&1f32.to_le_bytes());
+            let mut d: *mut c_void = core::ptr::null_mut();
+            let md = create_placed_x(dev, dva, &depth, console, 0x10, clear.as_ptr() as *const c_void, &mut d).expect("MSAA depth placed");
+            assert_eq!(md.kind, Kind::Local);
+            assert_eq!(md.offset, 0);
+            assert_ne!(md.heap, m0.heap, "the oversize depth must not sit in the shared reservation heap");
+            let next_va = dva + round_up(console, PLACEMENT_ALIGN);
+            let mut n: *mut c_void = core::ptr::null_mut();
+            let mn = create_placed_x(dev, next_va, &small, 0x4_0000, 0x4, core::ptr::null(), &mut n).expect("next title placement");
+            assert!(mn.heap != md.heap || mn.offset >= md.offset + pc.0, "next placement {:#x}+{:#x} overlaps the depth's PC tail", mn.heap, mn.offset);
+            assert_eq!((mn.heap, mn.offset), (m0.heap, next_va - r));
+            let mut a: *mut c_void = core::ptr::null_mut();
+            let ma = create_placed_x(dev, dva, &small, 0x4_0000, 0x4, core::ptr::null(), &mut a).expect("alias inside the console extent");
+            assert_eq!((ma.heap, ma.offset), (md.heap, 0), "title aliases inside the console extent share the depth's memory");
+            for x in [first, d, n, a] {
+                vcall!(x, 2, fn() -> u32);
+            }
+            flush();
+            VirtualFree(r as *mut c_void, 0, 0x8000);
+            vcall!(dev, 2, fn() -> u32);
         }
     }
 }

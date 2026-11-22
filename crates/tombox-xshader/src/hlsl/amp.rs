@@ -18,19 +18,19 @@ const VA_HELPERS: &str = r#"uint2 tb_va(uint lo, uint hi, uint off, uint offhi) 
 #ifndef TB_GMEM
 RWByteAddressBuffer tb_gfault : register(u2, spaceTB_GLOBAL_SPACE);
 void tb_gmiss(uint2 va) { uint o; tb_gfault.InterlockedAdd(0, 1u, o); if (o == 0u) tb_gfault.Store2(4, va); }
-uint tb_gmem_load(uint2 va) { tb_gmiss(va); return 0u; }
+uint tb_gmem_load(uint2 va, uint nbytes) { tb_gmiss(va); return 0u; }
 void tb_gmem_store(uint2 va, uint v) { tb_gmiss(va); }
 void tb_gmem_store_n(uint2 va, uint v, uint n) { tb_gmiss(va); }
 #endif
-uint tb_gload(uint2 va) {
+uint tb_gload(uint2 va, uint nbytes) {
     uint s = (va.x & 3u) * 8u;
     uint2 a = uint2(va.x & ~3u, va.y);
     int k = tb_ring(a);
-    if (k == -1000) return tb_gmem_load(va);
+    if (k == -1000) return tb_gmem_load(va, nbytes);
     uint lo = tb_ring_get(k);
-    if (s == 0u) return lo;
+    if ((va.x & 3u) + nbytes <= 4u) return lo >> s;
     int k2 = tb_ring(tb_va(a.x, a.y, 4u, 0u));
-    uint hi = k2 == -1000 ? tb_gmem_load(tb_va(a.x, a.y, 4u, 0u)) : tb_ring_get(k2);
+    uint hi = k2 == -1000 ? tb_gmem_load(tb_va(a.x, a.y, 4u, 0u), 4u) : tb_ring_get(k2);
     return (lo >> s) | (hi << (32u - s));
 }
 void tb_gstore_m(uint2 a, uint v, uint m) {
@@ -73,8 +73,8 @@ impl<'a> Emitter<'a> {
     }
 
     fn amp_threads(&self, m: &MeshInfo) -> Result<[u32; 3], String> {
-        if m.num_threads[0] != 0 {
-            return Ok(m.num_threads.map(|x| x.max(1)));
+        if m.num_threads != [0; 3] {
+            return Ok(m.num_threads);
         }
         let f = &self.ex.fssm;
         let w = |o: usize| f.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
@@ -143,7 +143,7 @@ impl<'a> Emitter<'a> {
                     _ => return Err("flat: bad vdst".into()),
                 };
                 for k in 0..n {
-                    self.line(&format!("uint tl{t}_{k} = (exec_lo & 1u) ? tb_gload({}) : 0u;", at(k)));
+                    self.line(&format!("uint tl{t}_{k} = (exec_lo & 1u) ? tb_gload({}, 4u) : 0u;", at(k)));
                 }
                 for k in 0..n {
                     self.wv(&Opnd::Vgpr(vd + k as u8), &format!("tl{t}_{k}"))?;
@@ -151,7 +151,8 @@ impl<'a> Emitter<'a> {
             }
             8..=11 => {
                 let vd = ins.dst.first().cloned().ok_or("flat: bad vdst")?;
-                let raw = format!("((exec_lo & 1u) ? tb_gload(ta{t}) : 0u)");
+                let bytes = if op < 10 { 1 } else { 2 };
+                let raw = format!("((exec_lo & 1u) ? tb_gload(ta{t}, {bytes}u) : 0u)");
                 let e = match op {
                     8 => format!("({raw} & 0xffu)"),
                     9 => format!("uint((int({raw} << 24u)) >> 24)"),
@@ -246,9 +247,7 @@ impl<'a> Emitter<'a> {
             return Err(format!("amplification payload of {} bytes exceeds the D3D12 limit {MAX_PAYLOAD}", m.payload_bytes));
         }
         let [tx, ty, tz] = self.amp_threads(&m)?;
-        if tx * ty * tz > 128 {
-            return Err(format!("amplification thread-group size {:?} above 128", m.num_threads));
-        }
+        let threads = crate::meta::mesh_thread_count([tx, ty, tz])?;
         let n = payload_dwords(m.payload_bytes.max(4));
         h.insert_str(0, "#define TB_AMP_GMEM 1\n");
         h.push_str(&self.ring_helpers(n, false));
@@ -259,14 +258,15 @@ impl<'a> Emitter<'a> {
             self.regs.insert(reg.to_string());
         }
         let _ = writeln!(h, "{}", self.reg_decls());
+        h.push_str(&self.ud_init());
         let _ = writeln!(h, "    v0 = gtid.x; v1 = gtid.y; v2 = gtid.z;");
         let _ = writeln!(h, "    s2 = {:#x}u; s3 = {:#x}u; s4 = gid.x; tb_gidx = gid.x;", ARGS_HI << 24, PAY_HI << 24);
-        let _ = writeln!(h, "    if (gi < 4u) tb_args[gi] = 0u;");
-        let _ = writeln!(h, "    for (uint tb_k = gi; tb_k < {n}u; tb_k += {}u) tb_pl.w[tb_k] = 0u;", tx * ty * tz);
+        let _ = writeln!(h, "    for (uint tb_k = gi; tb_k < 4u; tb_k += {threads}u) tb_args[tb_k] = 0u;");
+        let _ = writeln!(h, "    for (uint tb_k = gi; tb_k < {n}u; tb_k += {threads}u) tb_pl.w[tb_k] = 0u;");
         let _ = writeln!(h, "    GroupMemoryBarrierWithGroupSync();");
         h.push_str(&self.body);
         let _ = writeln!(h, "    GroupMemoryBarrierWithGroupSync();");
-        let _ = writeln!(h, "    DispatchMesh(tb_args[0], 1, 1, tb_pl);");
+        let _ = writeln!(h, "    DispatchMesh(tb_args[0], max(tb_args[1], 1u), max(tb_args[2], 1u), tb_pl);");
         h.push_str("}\n");
         Ok(h)
     }

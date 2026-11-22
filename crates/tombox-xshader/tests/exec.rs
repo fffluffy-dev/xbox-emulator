@@ -139,6 +139,7 @@ pub fn shader(words: &[u32]) -> ShaderExtract {
         isa,
         isa_offset_in_fssm: 0,
         isa_preamble: [0; 4],
+        psv_numthreads: None,
         has_input_sig: true,
         has_output_sig: true,
         has_psv0: false,
@@ -198,7 +199,8 @@ unsafe fn ctx_new() -> Ctx {
     let d3d = LoadLibraryA(b"d3d12.dll\0".as_ptr());
     let ser: unsafe extern "system" fn(*const u8, u32, *mut *mut c_void, *mut *mut c_void) -> i32 =
         core::mem::transmute(GetProcAddress(d3d, b"D3D12SerializeRootSignature\0".as_ptr()));
-    let desc = [0u8; 40];
+    let mut desc = [0u8; 40];
+    desc[32] = 1;
     let mut blob: *mut c_void = core::ptr::null_mut();
     let mut err: *mut c_void = core::ptr::null_mut();
     assert!(ser(desc.as_ptr(), 1, &mut blob, &mut err) >= 0, "serialize root signature");
@@ -230,12 +232,35 @@ unsafe fn draw(c: &mut Ctx, ps: &[u8]) -> Result<[u32; 4], String> {
 }
 
 unsafe fn draw_with(c: &mut Ctx, ps: &[u8], rs: *mut c_void, pre: &dyn Fn(*mut c_void), post: &dyn Fn(*mut c_void)) -> Result<[u32; 4], String> {
+    draw_graphics(c, ps, rs, pre, post, None)
+}
+
+#[repr(C)]
+struct VertexElement {
+    semantic: *const u8,
+    semantic_index: u32,
+    format: u32,
+    slot: u32,
+    offset: u32,
+    input_class: u32,
+    step_rate: u32,
+}
+
+unsafe fn draw_graphics(
+    c: &mut Ctx,
+    ps: &[u8],
+    rs: *mut c_void,
+    pre: &dyn Fn(*mut c_void),
+    post: &dyn Fn(*mut c_void),
+    vertex: Option<(&[u8], &[VertexElement])>,
+) -> Result<[u32; 4], String> {
     let mut d = vec![0u8; 656];
     let put32 = |d: &mut Vec<u8>, o: usize, v: u32| d[o..o + 4].copy_from_slice(&v.to_le_bytes());
     let put64 = |d: &mut Vec<u8>, o: usize, v: u64| d[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    let (vs, layout) = vertex.unwrap_or((&c.vs, &[]));
     put64(&mut d, 0, rs as u64);
-    put64(&mut d, 8, c.vs.as_ptr() as u64);
-    put64(&mut d, 16, c.vs.len() as u64);
+    put64(&mut d, 8, vs.as_ptr() as u64);
+    put64(&mut d, 16, vs.len() as u64);
     put64(&mut d, 24, ps.as_ptr() as u64);
     put64(&mut d, 32, ps.len() as u64);
     for i in 0..8 {
@@ -259,6 +284,10 @@ unsafe fn draw_with(c: &mut Ctx, ps: &[u8], rs: *mut c_void, pre: &dyn Fn(*mut c
         put32(&mut d, f + 4, 1);
         put32(&mut d, f + 8, 1);
         put32(&mut d, f + 12, 8);
+    }
+    if !layout.is_empty() {
+        put64(&mut d, 552, layout.as_ptr() as u64);
+        put32(&mut d, 560, layout.len() as u32);
     }
     put32(&mut d, 572, 3);
     put32(&mut d, 576, 1);
@@ -310,6 +339,48 @@ unsafe fn draw_with(c: &mut Ctx, ps: &[u8], rs: *mut c_void, pre: &dyn Fn(*mut c
         o[i] = u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
     }
     Ok(o)
+}
+
+#[test]
+fn vertex_fetch_reads_sparse_attributes_from_a_vertex_buffer() {
+    let input = |name, format, offset| VertexElement {
+        semantic: name, semantic_index: 0, format, slot: 0, offset, input_class: 0, step_rate: 0,
+    };
+    let layout = [
+        input(b"POSITION\0".as_ptr(), 16, 0),
+        input(b"NORMAL\0".as_ptr(), 2, 8),
+        input(b"TEXCOORD\0".as_ptr(), 42, 24),
+    ];
+    let mut vs = shader(&[0xbe84_2104, 0xf800_00cf, 0x0706_0504, 0xf800_0a0f, 0x0b0a_0908, S_ENDPGM]);
+    vs.stage = Stage::Vertex;
+    vs.input_sig = vec![sig("POSITION", 0, 3, 0, 3), sig("NORMAL", 0, 3, 1, 0xf), sig("TEXCOORD", 0, 1, 3, 4)];
+    vs.input_sig[0].rw_mask = 3;
+    vs.input_sig[2].rw_mask = 4;
+    vs.output_sig = vec![sig("SV_Position", 1, 3, 0, 0xf), sig("TEXCOORD", 0, 1, 1, 0xf)];
+    let vs = translate(&vs).unwrap();
+    let vertex_code = dxc::compile(&vs.hlsl, &dxc::profile_for(vs.profile)).unwrap();
+    let pixel_code = dxc::compile(
+        "uint4 main(float4 p : SV_Position, nointerpolation uint4 v : TEXCOORD0) : SV_Target { return v ^ uint4(uint2(p.xy), 0, 0); }",
+        "ps_6_0",
+    ).unwrap();
+    let vertices: Vec<u8> = [(-1.0f32, 1.0f32), (3.0, 1.0), (-1.0, -3.0)]
+        .into_iter()
+        .flat_map(|(x, y)| [x.to_bits(), y.to_bits(), 0x41a8_0000, 0, 0, 0, 0x1234])
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let mut c = CTX.get_or_init(|| Mutex::new(unsafe { ctx_new() })).lock().unwrap_or_else(|e| e.into_inner());
+    let result = unsafe {
+        let vb = c.gpu.buffer(vertices.len() as u64, 2, 0xac3, false).unwrap();
+        assert!(Gpu::map_write(vb, &vertices));
+        let view = [Gpu::gpu_va(vb), ((28u64) << 32) | vertices.len() as u64];
+        let rs = c.rs;
+        let result = draw_graphics(&mut c, &pixel_code, rs, &|list| {
+            vcall!(list, 44, fn(u32, u32, *const u64) -> (), 0, 1, view.as_ptr());
+        }, &|_| {}, Some((&vertex_code, &layout)));
+        d3d::release(vb);
+        result
+    };
+    assert_eq!(result.unwrap_or_else(|e| panic!("{e}\n{}", vs.hlsl)), [0, 0, 0x1234, 0x3f80_0000]);
 }
 
 pub fn hlsl_of(words: &[u32]) -> Result<String, String> {
@@ -804,6 +875,23 @@ fn scalar_sop2() {
 }
 
 #[test]
+fn scalar_bfe32_result_and_scc() {
+    let mut cases = Cases::new();
+    for (offset, width, unsigned, signed) in [
+        (16, 0, 0, 0),
+        (31, 1, 1, u32::MAX),
+        (28, 8, 8, 0xffff_fff8),
+        (16, 32, 0x8123, 0xffff_8123),
+        (0, 32, 0x8123_4567, 0x8123_4567),
+    ] {
+        let control = (width << 16) | offset;
+        s2(&mut cases, "s_bfe_u32", 0x27, 0x8123_4567, control, 1, unsigned, nz(u64::from(unsigned)));
+        s2(&mut cases, "s_bfe_i32", 0x28, 0x8123_4567, control, 1, signed, nz(u64::from(signed)));
+    }
+    cases.run_both("s_bfe32_result_and_scc");
+}
+
+#[test]
 fn scalar_sop1() {
     let mut c = Cases::new();
     let vals32: [u32; 7] = [0, 1, 0x8000_0000, 0xffff_ffff, 0x0001_0000, 0x7fff_fff0, 0x1234_0080];
@@ -866,6 +954,25 @@ fn saveexec(c: &mut Cases, m: &'static str, op: u32, a: u32, f: fn(u32, u32) -> 
         exp.push(0);
     }
     c.add(m, &pre, &[sop1(op, 20, 10)], &post, &exp);
+}
+
+#[test]
+fn wqm_of_exec_keeps_only_the_lane_bit_so_mask_loops_end() {
+    let mut c = Cases::new();
+    let mut post = pr();
+    post.raw(&[sop1(4, 30, 126)]).s2v(0, 30).s2v(1, 31);
+    c.add("s_wqm_b64", &pr(), &[sop1(0x0a, 126, 126)], &post, &[1, 0]);
+    let mut pre = pr();
+    pre.raw(&[sop1(4, 126, ic(-1)), sop1(4, 30, 126)]).sv(20, 0);
+    let mut post = pr();
+    post.raw(&[sop1(3, 126, ic(1)), sop1(3, 127, ic(0))]).s2v(0, 20).s2v(1, 30).s2v(2, 31);
+    c.add("s_add_u32", &pre, &[sop2(0, 20, 20, ic(1)), sop2(0x15, 30, 30, 126), sopp(0x05, 0xfffd)], &post, &[1, 0, 0]);
+    let mut pre = pr();
+    pre.raw(&[sop1(0x0a, 126, 126), sop1(4, 30, 126)]).sv(20, 0).sv(106, 1).sv(107, 0);
+    let mut post = pr();
+    post.s2v(0, 20).s2v(1, 30);
+    c.add("s_add_u32", &pre, &[sop2(0, 20, 20, ic(1)), sop1(0x24, 4, 106), sop2(0x15, 30, 30, 126), sop1(4, 126, 4), sopp(0x05, 0xfffb)], &post, &[1, 0]);
+    c.run_both("exec_lane_bit");
 }
 
 #[test]
@@ -969,7 +1076,7 @@ fn f2h(x: f32) -> u32 {
     if a >= 65520.0 {
         return s | 0x7c00;
     }
-    let mut best = 0u32;
+    let best;
     let mut lo = 0u32;
     let mut hi = 0x7c00u32;
     while lo < hi {
@@ -1355,6 +1462,60 @@ fn bytes_of(b: &[u32]) -> Vec<u8> {
 }
 
 #[test]
+fn mubuf_scalar_offset() {
+    let mut cases = Vec::new();
+    let source = bytes_of(&BUF);
+    let with_soffset = |opcode, immediate, offen| {
+        let mut words = mubuf(opcode, immediate, offen, false, false, 1, 4);
+        words[1] = (words[1] & 0x00ff_ffff) | (12 << 24);
+        words
+    };
+    for (scalar, vector, immediate, offen) in [(5, 0, 0, false), (0, 4, 2, true), (8, 3, 2, true)] {
+        let offset = (scalar + vector + immediate) as usize;
+        let mut pre = Prog::new();
+        pre.sv(12, scalar).vv(1, vector).vv(4, 0xab);
+        cases.push(BufCase {
+            m: "buffer_load_ubyte",
+            pre: pre.w.clone(),
+            op: with_soffset(0x08, immediate, offen),
+            rt: vec![u32::from(source[offset])],
+            mem: vec![],
+        });
+        let word = offset / 4;
+        let shift = (offset % 4) * 8;
+        let expected = (BUF[word] & !(0xff << shift)) | (0xab << shift);
+        cases.push(BufCase {
+            m: "buffer_store_byte",
+            pre: pre.w,
+            op: with_soffset(0x18, immediate, offen),
+            rt: vec![],
+            mem: vec![(word, expected), (word ^ 1, BUF[word ^ 1])],
+        });
+    }
+    let value = 0x1234_56ab;
+    for (scalar, vector, immediate, offen) in [(8, 0, 0, false), (0, 4, 4, true), (8, 4, 4, true)] {
+        let word = ((scalar + vector + immediate) / 4) as usize;
+        let mut pre = Prog::new();
+        pre.sv(12, scalar).vv(1, vector).vv(4, value);
+        cases.push(BufCase {
+            m: "buffer_load_dword",
+            pre: pre.w.clone(),
+            op: with_soffset(0x0c, immediate, offen),
+            rt: vec![BUF[word]],
+            mem: vec![],
+        });
+        cases.push(BufCase {
+            m: "buffer_store_dword",
+            pre: pre.w,
+            op: with_soffset(0x1c, immediate, offen),
+            rt: vec![],
+            mem: vec![(word, value), (word ^ 1, BUF[word ^ 1])],
+        });
+    }
+    run_buf_cases("mubuf_soffset", &cases);
+}
+
+#[test]
 fn buffer_mubuf() {
     let mut cs = Vec::new();
     let by = bytes_of(&BUF);
@@ -1386,6 +1547,25 @@ fn buffer_mubuf() {
     for &idx in &[0u32, 2, 5] {
         cs.push(BufCase { m: "buffer_store_format_x", pre: pre(idx, 0xc0ff_ee00, 0), op: mubuf(0x04, 0, false, true, false, 1, 4), rt: vec![], mem: vec![(idx as usize, 0xc0ff_ee00), ((idx as usize + 1) % 8, BUF[(idx as usize + 1) % 8])] });
     }
+    let pre_u4 = |idx: u32, x: u32, y: u32, z: u32| {
+        let mut p = Prog::new();
+        p.vv(1, idx).vv(4, x).vv(5, y).vv(6, z).raw(&[vop2(0x25, 4, ic(0), 4)]);
+        p.w
+    };
+    cs.push(BufCase {
+        m: "buffer_store_format_xy",
+        pre: pre_u4(0, 0x1122_3344, 0x5566_7788, 0x99aa_bbcc),
+        op: mubuf(0x05, 0, false, true, false, 1, 4),
+        rt: vec![],
+        mem: vec![(0, 0x1122_3344), (1, 0x5566_7788), (2, 0), (3, 0), (4, BUF[4])],
+    });
+    cs.push(BufCase {
+        m: "buffer_store_format_xyz",
+        pre: pre_u4(1, 0xdead_0001, 0xbeef_0002, 0xcafe_0003),
+        op: mubuf(0x06, 0, false, true, false, 1, 4),
+        rt: vec![],
+        mem: vec![(0, BUF[0]), (4, 0xdead_0001), (5, 0xbeef_0002), (6, 0xcafe_0003), (7, 0)],
+    });
     type At = fn(u32, u32, u32) -> u32;
     let atoms: [(&'static str, u32, At); 9] = [
         ("buffer_atomic_sub", 0x33, |m, s, _| m.wrapping_sub(s)),
@@ -2219,4 +2399,62 @@ fn second_forward_branch_into_open_guard_skips() {
     pre.vv(10, 0x1111).raw(&[SCC0]);
     c.add("s_cbranch_scc1", &pre, &[sopp(0x05, 4), vop1(1, 10, ic(7)), SCC0, sopp(0x05, 1), vop1(1, 10, ic(8))], &post, &[8]);
     c.run("branch_guard");
+}
+
+#[test]
+fn legacy_minmax_on_warp_keeps_a_nan_in_either_source() {
+    fn legacy(op: u32, a: u32, b: u32) -> u32 {
+        let mov = |dst: u32, val: u32| [0x7e00_0000 | (dst << 17) | (1 << 9) | 255, val];
+        let mut code = Vec::new();
+        code.extend_from_slice(&mov(1, a));
+        code.extend_from_slice(&mov(2, b));
+        code.push((op << 25) | (2 << 9) | (256 + 1));
+        code.push(S_ENDPGM);
+        let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let lowered = tombox_xshader::gcn::to_rdna2(&bytes).unwrap_or_else(|e| panic!("{e}"));
+        let mut words: Vec<u32> = lowered.isa[..lowered.code_len]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(words.pop(), Some(S_ENDPGM));
+        let mut p = Prog::new();
+        p.raw(&words);
+        run(&p.words()).unwrap_or_else(|e| panic!("{e}"))[0]
+    }
+    let nan = 0x7fc0_0000u32;
+    let one = 0x3f80_0000u32;
+    assert_eq!(legacy(0x0d, nan, one), one, "min with NaN in source 0");
+    assert_eq!(legacy(0x0d, one, nan), nan, "min with NaN in source 1");
+    assert_eq!(legacy(0x0e, nan, one), one, "max with NaN in source 0");
+    assert_eq!(legacy(0x0e, one, nan), nan, "max with NaN in source 1");
+    assert_eq!(legacy(0x0e, 0, 0x8000_0000), 0, "max of +0 and -0 keeps source 0");
+    assert_eq!(legacy(0x0e, 0x8000_0000, 0), 0x8000_0000, "max of -0 and +0 keeps source 0");
+}
+
+#[test]
+fn pkaccum_u8_packs_four_bytes_into_one_register() {
+    fn mov_lit(dst: u32, val: u32) -> [u32; 2] {
+        [0x7e00_0000 | (dst << 17) | (1 << 9) | 255, val]
+    }
+    fn mov_imm(dst: u32, imm: u32) -> u32 {
+        0x7e00_0000 | (dst << 17) | (1 << 9) | (128 + imm)
+    }
+    let mut code = vec![mov_imm(1, 0)];
+    for (i, bits) in [0x3f80_0000u32, 0x4000_0000, 0x4040_0000, 0x4080_0000].into_iter().enumerate() {
+        code.extend_from_slice(&mov_lit(0, bits));
+        code.push(mov_imm(2, i as u32));
+        code.push((0x2c << 25) | (1 << 17) | (2 << 9) | 256);
+    }
+    code.push(S_ENDPGM);
+    let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let lowered = tombox_xshader::gcn::to_rdna2(&bytes).unwrap_or_else(|e| panic!("{e}"));
+    let mut words: Vec<u32> = lowered.isa[..lowered.code_len]
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(words.pop(), Some(S_ENDPGM));
+    let mut p = Prog::new();
+    p.raw(&words);
+    let got = run(&p.words()).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(got[1], 0x0403_0201, "{got:08x?}");
 }

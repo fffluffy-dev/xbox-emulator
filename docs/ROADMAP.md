@@ -24,7 +24,7 @@ Nothing else matters if the tree does not build and the tests do not run.
 | Step | State | Notes |
 |---|---|---|
 | Every shader of the tested titles translates | ✅ | 105,506 / 105,506 in the sweep. |
-| RDNA2 instructions verified on a GPU | 🟨 | 768 / 781. The rest are held at yellow in [BLOCKERS.md](BLOCKERS.md). |
+| RDNA2 instructions verified on a GPU | 🟨 | 787 / 794. 19 were added on 2026-11-22 from passing WARP tests: f16 FMAs, packed 16-bit shifts, the 32-bit image atomics and the GWS counter ops. Open: `s_bfe_u32` / `s_bfe_i32` with a field width of 32 or more (two rules disagree), `s_sendmsghalt` (no faithful PC equivalent), and `ds_gws_sema_p`, `ds_gws_barrier`, `ds_gws_sema_release_all` and `ds_ordered_count` (need cross-group wave ordering). |
 | Round modes on drivers that fold `(double)(float)x` | ✅ | [#20](https://github.com/fffluffy-dev/xbox-emulator/issues/20) / [#21](https://github.com/fffluffy-dev/xbox-emulator/pull/21). The Deck shows 0 failures. |
 | DPP with two shuffles on RADV | 🟨 | The full fragment fails on the Deck and smaller cuts are pushed (`claude/fp-mode-probe`). The next step is to run them and find the smallest failing case. |
 | f64 denormals in `div_f64` / `trig_preop` on RADV | 🟨 | [#18](https://github.com/fffluffy-dev/xbox-emulator/issues/18). Basic f64 denormals and fma are correct on the Deck, so the cause is in these two sequences. |

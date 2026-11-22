@@ -7,7 +7,6 @@ use std::fmt::Write as _;
 pub const GS_ALLOC_REQ: u32 = 9;
 pub const EXP_PRIM: u32 = 20;
 pub const MS_LDS_DWORDS: usize = 7167;
-pub const AS_ABI_UNKNOWN: &str = "amplification shader: the console AS (xgs12_10 0xde6f0) gets s[0:1] = user-data block, s2 = mesh-args ring >> 8, s3 = payload ring >> 8 and gid.x offset by COMPUTE_START_X, and leaves through global memory stores into those rings; the translator has no global-store path and the per-entry ring addressing and the mesh shader's payload register are not decoded";
 
 /// Guest wave size. The FSSM header states it (flags word u32[0xD4], bit 5: set = wave32,
 /// clear = wave64); code markers (v_mbcnt_hi, 64-bit saveexec / EXEC writes) only prove wave64
@@ -49,11 +48,7 @@ impl<'a> Emitter<'a> {
 
     fn ms_threads(&self) -> Result<u32, String> {
         let m = self.mesh_info()?;
-        let n = m.num_threads.iter().map(|&x| x.max(1)).product::<u32>();
-        if m.num_threads[0] == 0 || n > 128 {
-            return Err(format!("mesh shader thread-group size {:?} outside 1..128", m.num_threads));
-        }
-        Ok(n)
+        crate::meta::mesh_thread_count(m.num_threads)
     }
 
     pub(super) fn mesh_mbcnt(&self, ins: &Insn, b: String) -> Result<String, String> {
@@ -79,6 +74,15 @@ impl<'a> Emitter<'a> {
         }
         let w = wave_size(&self.insns, &self.ex.fssm);
         Ok(Some(format!("(gid.x * {}u + (gi & {:#x}u))", self.ms_threads()?, !(w - 1))))
+    }
+
+    fn uniform_entry_allocation(&self) -> bool {
+        let [load, send, tail @ ..] = self.insns.as_slice() else { return false };
+        load.mnemonic == "s_mov_b32" && load.dst.first() == Some(&Opnd::M0)
+            && matches!(load.src.first(), Some(Opnd::Literal(_) | Opnd::ConstInt(_)))
+            && send.mnemonic == "s_sendmsg" && send.aux.imm == i64::from(GS_ALLOC_REQ)
+            && !tail.iter().any(|i| i.mnemonic.starts_with("s_branch")
+                || i.mnemonic.starts_with("s_cbranch") || i.mnemonic == "s_sendmsg")
     }
 
     pub(super) fn mesh_sendmsg(&mut self, ins: &Insn) -> Result<(), String> {
@@ -204,19 +208,23 @@ impl<'a> Emitter<'a> {
 ");
             h.push_str(p);
         }
-        let _ = writeln!(h, "groupshared uint tb_mscnt;");
+        let local_counts = self.uniform_entry_allocation() && !self.uses_lds;
+        if !local_counts {
+            let _ = writeln!(h, "groupshared uint tb_mscnt;");
+        }
         let _ = writeln!(h, "struct SOut {{");
         for (ei, e) in self.ex.output_sig.iter().enumerate() {
             let (ty, _) = sig_type(e);
             if e.sysval == 1 {
                 let _ = writeln!(h, "    precise {ty} o{ei} : {};", semantic(e));
             } else {
-                let _ = writeln!(h, "    {ty} o{ei} : {};", semantic(e));
+                let interp = self.out_interp.for_output(e).map(|m| format!("{m} ")).unwrap_or_default();
+                let _ = writeln!(h, "    {interp}{ty} o{ei} : {};", semantic(e));
             }
         }
         let _ = writeln!(h, "}};");
         let _ = writeln!(h, "struct SPrim {{ bool cull : SV_CullPrimitive; }};");
-        let [tx, ty_, tz] = m.num_threads.map(|x| x.max(1));
+        let [tx, ty_, tz] = m.num_threads;
         let _ = writeln!(h, "[numthreads({tx}, {ty_}, {tz})]");
         let _ = writeln!(h, "[outputtopology(\"{topo}\")]");
         let _ = writeln!(
@@ -232,16 +240,23 @@ impl<'a> Emitter<'a> {
             self.amp_ms_regs();
         }
         let _ = writeln!(h, "{}", self.reg_decls());
+        h.push_str(&self.ud_init());
         let w = wave_size(&self.insns, &self.ex.fssm);
         let _ = writeln!(h, "    SOut o = (SOut)0; uint tb_prim = 0u;");
-        let _ = writeln!(h, "    if (gi == 0u) tb_mscnt = 0u;");
-        let _ = writeln!(h, "    GroupMemoryBarrierWithGroupSync();");
+        if local_counts {
+            let _ = writeln!(h, "    uint tb_mscnt = 0u;");
+        } else {
+            let _ = writeln!(h, "    if (gi == 0u) tb_mscnt = 0u;");
+            let _ = writeln!(h, "    GroupMemoryBarrierWithGroupSync();");
+        }
         let _ = writeln!(h, "    v5 = gid.x * {n}u + gi; s3 = (gi / {w}u) << 24;");
         if pl.is_some() {
             h.push_str(&self.amp_ms_prologue(m.payload_bytes));
         }
         h.push_str(&self.body);
-        let _ = writeln!(h, "    GroupMemoryBarrierWithGroupSync();");
+        if !local_counts {
+            let _ = writeln!(h, "    GroupMemoryBarrierWithGroupSync();");
+        }
         let _ = writeln!(h, "    uint tb_nv = tb_mscnt & 0xfffu, tb_np = (tb_mscnt >> 12) & 0xfffu;");
         let _ = writeln!(h, "    SetMeshOutputCounts(tb_nv, tb_np);");
         let _ = writeln!(h, "    if (gi < tb_nv) verts[gi] = o;");

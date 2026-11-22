@@ -5,6 +5,7 @@
 *.bin
 *.dll
 *.exe
+*.pdb
 input/
 dumps/
 target/
@@ -29,3 +30,5 @@ emulator/
 *.part
 *.crdownload
 tools/progress/proposed_*.json
+__pycache__/
+*.pyc
