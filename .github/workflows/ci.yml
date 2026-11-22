@@ -52,8 +52,22 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 240
     continue-on-error: true
+    env:
+      # Crates a clean clone cannot build yet (#14): unpublished modules / console data blobs,
+      # and the test targets upstream omonkeyz/xbox-emulator#12 fixes. compat-common runs its
+      # lib tests in a separate step (only its online_ready_up_replay test needs backend data).
+      EXCLUDE: >-
+        --exclude gcxaudioext --exclude xaudio2_9 --exclude wldp
+        --exclude gamecorecomproxy --exclude connectedstorageservice_proxystub
+        --exclude xg_xs --exclude xbsc_xs --exclude gamehost --exclude compat-common
     steps:
       - uses: actions/checkout@v4
+      - name: libopus sources (third_party/opus, 316c675fa1c9)
+        shell: pwsh
+        run: |
+          git clone --filter=blob:none https://github.com/xiph/opus.git "$env:RUNNER_TEMP\opus"
+          git -C "$env:RUNNER_TEMP\opus" checkout --quiet 316c675fa1c9
+          "TOMBOX_OPUS_SRC=$env:RUNNER_TEMP\opus" >> $env:GITHUB_ENV
       - uses: Swatinem/rust-cache@v2
         with:
           key: windows-workspace
@@ -61,13 +75,19 @@ jobs:
         id: build
         shell: pwsh
         run: |
-          cargo build --workspace --all-targets --keep-going --message-format=short 2>&1 | Tee-Object -FilePath build.log
+          cargo build --workspace $($env:EXCLUDE -split ' ') --all-targets --keep-going --message-format=short 2>&1 | Tee-Object -FilePath build.log
           exit $LASTEXITCODE
       - name: Test workspace
         if: always()
         shell: pwsh
         run: |
-          cargo test --workspace --no-fail-fast 2>&1 | Tee-Object -FilePath test.log
+          cargo test --workspace $($env:EXCLUDE -split ' ') --no-fail-fast 2>&1 | Tee-Object -FilePath test.log
+          exit $LASTEXITCODE
+      - name: Test compat-common (lib)
+        if: always()
+        shell: pwsh
+        run: |
+          cargo test -p compat-common --lib --no-fail-fast 2>&1 | Tee-Object -FilePath test-common.log
           exit $LASTEXITCODE
       - name: Summary
         if: always()
@@ -76,7 +96,7 @@ jobs:
           "## Build errors" >> $env:GITHUB_STEP_SUMMARY
           if (Test-Path build.log) { Select-String -Path build.log -Pattern '^error' | Select-Object -First 80 | ForEach-Object { "    $($_.Line)" } >> $env:GITHUB_STEP_SUMMARY }
           "## Test results" >> $env:GITHUB_STEP_SUMMARY
-          if (Test-Path test.log) { Select-String -Path test.log -Pattern 'test result:|FAILED|panicked|Running ' | Select-Object -First 400 | ForEach-Object { "    $($_.Line)" } >> $env:GITHUB_STEP_SUMMARY }
+          foreach ($f in 'test.log', 'test-common.log') { if (Test-Path $f) { Select-String -Path $f -Pattern 'test result:|FAILED|panicked|Running ' | Select-Object -First 400 | ForEach-Object { "    $($_.Line)" } >> $env:GITHUB_STEP_SUMMARY } }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -84,4 +104,5 @@ jobs:
           path: |
             build.log
             test.log
+            test-common.log
           if-no-files-found: ignore
