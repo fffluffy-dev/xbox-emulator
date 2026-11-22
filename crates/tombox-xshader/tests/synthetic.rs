@@ -277,6 +277,34 @@ fn texel_type_follows_the_use_of_the_loaded_value() {
     assert!(t.hlsl.contains("float4 t0 = tex0.Load("), "{}", t.hlsl);
 }
 
+/// MIMG with TFE returns a texel-fail status in the VGPR after the data. D3D12 resources the
+/// translator binds are always resident, so the status reads as 0, and it must be written:
+/// left alone, the shader would test whatever the register held before.
+#[test]
+fn tfe_status_vgpr_follows_the_returned_data() {
+    let root = || Some(RootSig { version: 2, flags: 1, params: vec![table(0, 64, 5), table(2, 16, 5)], num_static_samplers: 0, static_samplers: Vec::new() });
+    let words = [
+        0xf40c_0004, // s_load_dwordx8 s0, s8 [off=0]: texture descriptor t0
+        0xfa00_0000,
+        0x7e00_0280, // v_mov_b32 v0, 0
+        0x7e02_0287, // v_mov_b32 v1, 7 (y coordinate; the status overwrites it)
+        0xf001_1108, // image_load v0 <- 2D texture, dmask 1, TFE: status in v1
+        0x0000_0000,
+        0x3604_0081, // v_and_b32 v2, 1, v0
+        0x3606_0281, // v_and_b32 v3, 1, v1
+        S_NOP,
+        PACK_V0_V2_V2,
+        PACK_V1_V2_V2,
+        EXP_MRT0_COMPR[0],
+        EXP_MRT0_COMPR[1],
+        S_ENDPGM,
+    ];
+    let ex = shader(Stage::Pixel, &words, vec![], vec![sig("SV_Target", 64, 3, 0, 0xf)], root());
+    let t = translate(&ex).expect("translate");
+    let body = t.hlsl.split("tex0.Load(").nth(1).unwrap_or_else(|| panic!("no texel load:\n{}", t.hlsl));
+    assert!(body.lines().any(|l| l.trim() == "v1 = TB_WV(0u, v1);"), "{}", t.hlsl);
+}
+
 #[test]
 fn loops_translate_deterministically() {
     let mut words = Vec::new();

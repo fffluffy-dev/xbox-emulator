@@ -16,6 +16,17 @@ pub(super) fn mimg_d16(ins: &Insn) -> bool {
         && ins.raw.get(1).is_some_and(|w| (w >> 31) & 1 != 0)
 }
 
+/// TFE (word0 bit 16, same position on GFX7 and GFX10): the op returns one extra status VGPR
+/// after its data. Stores, atomics, BVH and get_resinfo have no status result.
+pub(super) fn mimg_tfe(ins: &Insn) -> bool {
+    ins.enc == Enc::Mimg
+        && !ins.mnemonic.starts_with("image_bvh")
+        && !ins.mnemonic.starts_with("image_atomic")
+        && !ins.mnemonic.starts_with("image_store")
+        && ins.mnemonic != "image_get_resinfo"
+        && ins.raw.first().is_some_and(|w| (w >> 16) & 1 != 0)
+}
+
 pub(super) fn mimg_data_regs(ins: &Insn) -> u32 {
     let c = if ins.mnemonic.starts_with("image_gather") { 4 } else { (ins.aux.mask & 0xf).count_ones() };
     if mimg_d16(ins) {
