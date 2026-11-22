@@ -601,6 +601,17 @@ fn image_atomics_on_a_uint_uav() {
     }
 }
 
+/// 64-bit image atomics (dmask 3, cmpswap 0xf) are refused, not narrowed to 32 bits.
+#[test]
+fn image_atomic_64bit_forms_are_refused() {
+    let root = || Some(RootSig { version: 2, flags: 1, params: vec![table(1, 64)], num_static_samplers: 0, static_samplers: Vec::new() });
+    for (op, dmask) in [(0x11, 3), (0x10, 0xf)] {
+        let body = [0xf40c_0004, 0xfa00_0000, img_atomic(op, dmask, true), 0x0000_0401, vop1(1, 0, v(4))];
+        let e = translate(&shader(&program(&body), root())).err().unwrap_or_else(|| panic!("op {op:#x} translated"));
+        assert!(e.contains("only the 32-bit form"), "{e}");
+    }
+}
+
 /// Without GLC an image atomic returns nothing: vdata keeps the operand.
 #[test]
 fn image_atomic_without_glc_keeps_vdata() {

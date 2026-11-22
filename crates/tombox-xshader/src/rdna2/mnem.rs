@@ -296,8 +296,9 @@ pub fn smem(op: u32) -> Option<&'static str> {
 
 pub fn mimg(op: u32) -> Option<&'static str> {
     Some(match op {
-        // 0x11 / 0x17: image atomics, named from the public GFX10 opcode table; consistent with
-        // their use in 0de8a1db88825b8e (counter add, packed-value max). Other atomics unmapped.
+        // 0x0f..0x1c: image atomics, named from the public GFX10 opcode table (SI numbering, no
+        // rsub); add / umax match their use in 0de8a1db88825b8e (counter add, packed-value max).
+        // The float atomics 0x1d..0x1f stay unmapped.
         0x0f => "image_atomic_swap", 0x10 => "image_atomic_cmpswap", 0x11 => "image_atomic_add",
         0x12 => "image_atomic_sub", 0x14 => "image_atomic_smin", 0x15 => "image_atomic_umin",
         0x16 => "image_atomic_smax", 0x17 => "image_atomic_umax", 0x18 => "image_atomic_and",

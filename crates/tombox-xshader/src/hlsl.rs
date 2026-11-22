@@ -5462,6 +5462,12 @@ impl<'a> Emitter<'a> {
                 // GLC (word0 bit 13) selects whether the pre-op value is returned; without it
                 // vdata keeps the operand.
                 let glc = ins.raw.first().is_some_and(|w| (w >> 13) & 1 != 0);
+                // dmask gives the data width: 1 (cmpswap 3) for 32-bit, 3 (cmpswap 0xf) for the
+                // 64-bit forms, which a RWTexture<uint> texel cannot hold.
+                let want = if ins.mnemonic == "image_atomic_cmpswap" { 3 } else { 1 };
+                if ins.aux.mask & 0xf != want {
+                    return Err(format!("{} with dmask {:#x}: only the 32-bit form is supported", ins.mnemonic, ins.aux.mask & 0xf));
+                }
                 let o = Opnd::Vgpr(vd);
                 self.touch(&o);
                 let val = r(&o)?;
@@ -5484,7 +5490,7 @@ impl<'a> Emitter<'a> {
                     self.line(&format!("uint t{t} = 0u; if (exec_lo & 1u) {{ {func}({target}, {arg}, t{t}); }}"));
                 } else if op == "cmpswap" {
                     // vdata = {source, compare}; the texel takes the source when it equals compare.
-                    let cmp = Opnd::Vgpr(vd + 1);
+                    let cmp = Opnd::Vgpr(vd.checked_add(1).ok_or("image_atomic_cmpswap: compare register past v255")?);
                     self.touch(&cmp);
                     self.line(&format!("uint t{t} = 0u; if (exec_lo & 1u) {{ InterlockedCompareExchange({target}, {}, {val}, t{t}); }}", r(&cmp)?));
                 } else {
