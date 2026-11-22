@@ -760,15 +760,6 @@ mod tests {
         assert_eq!(d.last().unwrap().mnemonic, "s_endpgm");
     }
 
-    #[test]
-    fn truncated_last_instruction_is_an_error() {
-        // A two-dword encoding (MIMG, MUBUF, VOP3, ...) cut off by the end of the code.
-        for w in [0xf000_0000u32, 0xe000_0000, 0xd200_0000, 0xbe80_03ff] {
-            let e = to_rdna2(&w.to_le_bytes()).err().unwrap_or_else(|| panic!("{w:#010x} lowered"));
-            assert!(e.contains("truncated"), "{w:#010x}: {e}");
-        }
-    }
-
     fn words(b: &[u8]) -> Vec<u32> {
         b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
     }
@@ -932,6 +923,15 @@ mod tests {
         eprintln!("durango -> hlsl: {hok}/{} translated", all.len());
         for (e, n) in &herr {
             eprintln!("  hlsl {n:4}  {e}");
+        }
+    }
+
+    #[test]
+    fn truncated_last_instruction_is_an_error() {
+        // A two-dword encoding (MIMG, MUBUF, VOP3, ...) cut off by the end of the code.
+        for w in [0xf000_0000u32, 0xe000_0000, 0xd200_0000, 0xbe80_03ff] {
+            let e = to_rdna2(&w.to_le_bytes()).err().unwrap_or_else(|| panic!("{w:#010x} lowered"));
+            assert!(e.contains("truncated"), "{w:#010x}: {e}");
         }
     }
 }
