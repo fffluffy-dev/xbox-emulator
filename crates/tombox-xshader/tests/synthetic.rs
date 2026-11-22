@@ -281,6 +281,34 @@ fn texel_type_follows_the_use_of_the_loaded_value() {
     assert!(t.hlsl.contains("float4 t0 = tex0.Load("), "{}", t.hlsl);
 }
 
+/// MIMG with TFE returns a texel-fail status in the VGPR after the data. D3D12 resources the
+/// translator binds are always resident, so the status reads as 0, and it must be written:
+/// left alone, the shader would test whatever the register held before.
+#[test]
+fn tfe_status_vgpr_follows_the_returned_data() {
+    let root = || Some(RootSig { version: 2, flags: 1, params: vec![table(0, 64, 5), table(2, 16, 5)], num_static_samplers: 0, static_samplers: Vec::new() });
+    let words = [
+        0xf40c_0004, // s_load_dwordx8 s0, s8 [off=0]: texture descriptor t0
+        0xfa00_0000,
+        0x7e00_0280, // v_mov_b32 v0, 0
+        0x7e02_0287, // v_mov_b32 v1, 7 (y coordinate; the status overwrites it)
+        0xf001_1108, // image_load v0 <- 2D texture, dmask 1, TFE: status in v1
+        0x0000_0000,
+        0x3604_0081, // v_and_b32 v2, 1, v0
+        0x3606_0281, // v_and_b32 v3, 1, v1
+        S_NOP,
+        PACK_V0_V2_V2,
+        PACK_V1_V2_V2,
+        EXP_MRT0_COMPR[0],
+        EXP_MRT0_COMPR[1],
+        S_ENDPGM,
+    ];
+    let ex = shader(Stage::Pixel, &words, vec![], vec![sig("SV_Target", 64, 3, 0, 0xf)], root());
+    let t = translate(&ex).expect("translate");
+    let body = t.hlsl.split("tex0.Load(").nth(1).unwrap_or_else(|| panic!("no texel load:\n{}", t.hlsl));
+    assert!(body.lines().any(|l| l.trim() == "v1 = TB_WV(0u, v1);"), "{}", t.hlsl);
+}
+
 #[test]
 fn loops_translate_deterministically() {
     let mut words = Vec::new();
@@ -406,4 +434,59 @@ fn memory_descriptor_images_come_from_the_descriptor_heap() {
     }
     // No static register binding for the heap objects.
     assert!(!t.hlsl.contains(": register(t1") && !t.hlsl.contains(": register(s0)"), "{}", t.hlsl);
+}
+/// Vertex inputs follow the FSSM header's input table (first VGPR per input) when it is there:
+/// a VS merged in front of a GS gets its first attribute in v9, not in v4 as the plain-VS
+/// fallback grouping assumes.
+#[test]
+fn vertex_inputs_follow_the_fssm_input_table() {
+    let words = [
+        0xf800_08cf, // exp pos0 v9, v10, v11, v12 (done)
+        0x0c0b_0a09,
+        S_ENDPGM,
+    ];
+    let mut attr = sig("ATTRIBUTE", 0, 3, 0, 0xf);
+    attr.rw_mask = 0xf;
+    let mut ex = shader(Stage::Vertex, &words, vec![attr], vec![sig("SV_Position", 1, 3, 0, 0xf)], None);
+    let mut fssm = vec![0u8; 0x200];
+    fssm[0..4].copy_from_slice(b"FSSM");
+    fssm[0x138..0x13d].copy_from_slice(&[6, 0, 0xf, 9, 3]);
+    ex.fssm = fssm;
+    let t = translate(&ex).expect("translate");
+    for (v, c) in [(9, 'x'), (10, 'y'), (11, 'z'), (12, 'w')] {
+        assert!(t.hlsl.contains(&format!("v{v} = asuint(i.i0.{c});")), "v{v}:\n{}", t.hlsl);
+    }
+    assert!(!t.hlsl.contains("v4 = asuint(i.i0.x);"), "{}", t.hlsl);
+    // Without the table the plain-VS grouping still applies.
+    ex.fssm = Vec::new();
+    let t = translate(&ex).expect("translate without table");
+    assert!(t.hlsl.contains("v4 = asuint(i.i0.x);"), "{}", t.hlsl);
+}
+
+/// Store and atomic data registers are reads. A pixel shader that writes the fragment
+/// position (v2, entry ABI) straight into a UAV must still get v2 initialised from SV_Position;
+/// before, the store's vdata counted as a write and v2 stayed 0.
+#[test]
+fn store_data_registers_count_as_entry_reads() {
+    let root = || Some(RootSig { version: 2, flags: 1, params: vec![table(1, 8, 5)], num_static_samplers: 0, static_samplers: Vec::new() });
+    let mut pos = sig("SV_Position", 1, 3, 0, 0xf);
+    pos.rw_mask = 1;
+    let cases: [(&str, [u32; 2]); 2] = [
+        ("buffer_store_dword v2", [0xe070_0000, 0x8000_0200]),
+        ("image_store v2", [0xf020_0108, 0x0000_0200]),
+    ];
+    for (label, st) in cases {
+        let words = [
+            0xf40c_0004, // s_load_dwordx8 s0, s8: the UAV descriptor
+            0xfa00_0000,
+            0x7e00_0280, // v_mov_b32 v0, 0 (address)
+            0x7e02_0280, // v_mov_b32 v1, 0
+            st[0],
+            st[1],
+            S_ENDPGM,
+        ];
+        let ex = shader(Stage::Pixel, &words, vec![pos.clone()], vec![], root());
+        let t = translate(&ex).unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert!(t.hlsl.contains("v2 = asuint(i.i0.x);"), "{label}:\n{}", t.hlsl);
+    }
 }

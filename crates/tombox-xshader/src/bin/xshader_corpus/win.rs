@@ -180,7 +180,7 @@ fn usage() {
     eprintln!("pack root: {}", shader_cache::root().display());
 }
 
-fn main() -> ExitCode {
+pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut hashes: Vec<String> = Vec::new();
