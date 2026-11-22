@@ -1,6 +1,8 @@
 pub const TB_GLOBAL_SPACE: u32 = 4_000_003;
 pub const TB_GLOBAL_WINDOWS: usize = 2;
 pub const TB_GLOBAL_CBV: u32 = 0;
+/// Memory-descriptor mode: initial s0..s31 (cbuffer TbUser, 8 x uint4) in the global space.
+pub const TB_USER_CBV: u32 = 1;
 pub const TB_GLOBAL_FAULT_UAV: u32 = TB_GLOBAL_WINDOWS as u32;
 pub const TB_GLOBAL_CB_DWORDS: usize = 4 * TB_GLOBAL_WINDOWS + 4;
 pub const TB_GLOBAL_FAULT_BYTES: usize = 16;

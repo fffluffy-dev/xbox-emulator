@@ -77,10 +77,13 @@ fn external_root_signature_binds_a_stripped_mesh_shader() {
             num_threads: [32, 1, 1],
         }),
     });
-    let Err(error) = translate(&ex) else {
-        panic!("translation unexpectedly accepted the missing root descriptor");
-    };
-    assert!(error.contains("base s16 is not a buffer descriptor"), "{error}");
+    // Without a root signature the V# in s16..s19 is a run-time value: the memory-descriptor
+    // fallback reads it from the user-data cbuffer and loads through the global windows.
+    let mem = translate(&ex).expect("memory-descriptor fallback");
+    assert!(mem.mem_user_data && mem.needs_global, "{}", mem.hlsl);
+    for want in ["cbuffer TbUser", "s16 = tb_user[4].x", "s18 = tb_user[4].z", "tb_gmem_load(tb_gva(s16, s17 & 0xffffu"] {
+        assert!(mem.hlsl.contains(want), "missing `{want}` in\n{}", mem.hlsl);
+    }
 
     let body = [
         2u32, 1, 24, 0, 0, 0,
@@ -101,6 +104,7 @@ fn external_root_signature_binds_a_stripped_mesh_shader() {
         ex.root_sig = Some(parse_root_signature(external).expect("parse external root signature"));
         assert!(!ex.has_root_sig);
         let translated = translate(&ex).expect("translate with external root signature");
+        assert!(!translated.mem_user_data, "a root signature keeps the static binding");
         assert_eq!(translated.profile, "ms_6_5");
         assert!(translated.hlsl.contains("register(b5, space2)"), "{}", translated.hlsl);
     }
@@ -324,4 +328,61 @@ fn pixel_attribute_past_the_interpolants_reads_the_layer_sysval() {
     let ex = shader(Stage::Pixel, &words, vec![pos, layer], vec![sig("SV_Target", 64, 3, 0, 1)], None);
     let t = translate(&ex).expect("v_interp_mov of the layer attribute translates");
     assert!(t.hlsl.contains("(uint)(i.i1.x)"), "{}", t.hlsl);
+}
+
+/// Memory-descriptor mode (no root signature): a descriptor table pointer in user SGPRs
+/// s[16:17], a V# loaded from it with s_load, a constant read through that V# with
+/// s_buffer_load, and a buffer store through it.
+fn mem_desc_program() -> Vec<u32> {
+    vec![
+        0xf408_0108, // s_load_dwordx4 s[4:7], s[16:17], 0x20
+        0xfa00_0020,
+        0xf420_0202, // s_buffer_load_dword s8, s[4:7], 0x10
+        0xfa00_0010,
+        0x7e02_0208, // v_mov_b32 v1, s8
+        0xe070_1000, // buffer_store_dword v1, v0, s[4:7], 0 offen
+        0x8001_0100,
+        S_ENDPGM,
+    ]
+}
+
+#[test]
+fn memory_descriptors_load_through_the_global_windows() {
+    let mut ex = shader(Stage::Compute, &mem_desc_program(), vec![], vec![], None);
+    ex.isa_preamble = [0, 64, 1, 1];
+    (ex.has_input_sig, ex.has_output_sig) = (false, false);
+    let t = translate(&ex).expect("memory-descriptor translation");
+    assert!(t.mem_user_data && t.needs_global, "{}", t.hlsl);
+    for want in [
+        "cbuffer TbUser",
+        "s16 = tb_user[4].x",
+        "s17 = tb_user[4].y",
+        "+ 0x20u + 0u;",
+        "<= s6) ? tb_gmem_load(tb_gva(s4, s5 & 0xffffu, t1o + 0u, 0)) : 0u;",
+        "(s5 >> 16) & 0x3fffu;",
+        "tb_gmem_store(tb_gva(s4, s5 & 0xffffu",
+    ] {
+        assert!(t.hlsl.contains(want), "missing `{want}` in\n{}", t.hlsl);
+    }
+}
+
+/// A shader that needs memory-descriptor mode (a buffer through a V# from memory) and also
+/// samples an image: the T# came from memory too, and without the bindless lookup the
+/// translation must refuse instead of binding a guessed register.
+#[test]
+fn memory_descriptor_mode_refuses_images_with_a_clear_message() {
+    let mut words = mem_desc_program();
+    words.pop();
+    words.extend([
+        0xf40c_0508, // s_load_dwordx8 s[20:27], s[16:17], 0x40
+        0xfa00_0040,
+        0xf000_0f08, // image_load v[4:7], v0, s[20:27] (2D, dmask 0xf)
+        0x0005_0400,
+        S_ENDPGM,
+    ]);
+    let mut ex = shader(Stage::Compute, &words, vec![], vec![], None);
+    ex.isa_preamble = [0, 64, 1, 1];
+    (ex.has_input_sig, ex.has_output_sig) = (false, false);
+    let e = translate(&ex).err().expect("an image from a memory descriptor is not supported yet");
+    assert!(e.contains("memory-descriptor fallback after") && e.contains("bindless"), "{e}");
 }

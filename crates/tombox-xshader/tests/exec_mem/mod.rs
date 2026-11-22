@@ -8,6 +8,7 @@ mod gds;
 mod exp;
 mod flat;
 mod global;
+mod memdesc;
 mod mimg;
 mod mtbuf;
 mod rootmem;
