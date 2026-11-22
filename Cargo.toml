@@ -117,6 +117,7 @@ members = [
     "crates/tools/xreplay",
     "crates/tools/audio-replay",
     "crates/tools/compat_smoke",
+    "crates/tools/tombox-launch",
     "crates/tests/audio_titles",
 ]
 

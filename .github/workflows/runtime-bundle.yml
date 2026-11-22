@@ -1,0 +1,74 @@
+name: runtime-bundle
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, "claude/tombox-launch"]
+    paths:
+      - "crates/**"
+      - "tools/dev/mdbg.rs"
+      - "Cargo.lock"
+      - ".github/workflows/runtime-bundle.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-bundle-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  bundle:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      EXCLUDE: >-
+        --exclude gcxaudioext --exclude xaudio2_9 --exclude wldp
+        --exclude gamecorecomproxy --exclude connectedstorageservice_proxystub
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Check out pinned Opus sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: xiph/opus
+          ref: 316c675fa1c9982d76e9cdcba7231076f75047da
+          path: third_party/opus
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: runtime-bundle-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: runtime-bundle-${{ runner.os }}-
+      - name: Build runtime DLLs and tools (release)
+        shell: pwsh
+        run: |
+          $env:TOMBOX_OPUS_SRC = Join-Path $PWD 'third_party\opus'
+          cargo build --release --workspace $($env:EXCLUDE -split ' ') --lib --bins --keep-going 2>&1 | Tee-Object -FilePath bundle-build.log
+          rustc -O --edition 2021 tools/dev/mdbg.rs -o target/release/mdbg.exe
+          exit 0
+      - name: Collect bundle
+        shell: pwsh
+        run: |
+          $out = "tombox-runtime"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Get-ChildItem target/release -File | Where-Object { $_.Extension -in '.dll', '.exe' } | Copy-Item -Destination $out
+          git rev-parse HEAD > "$out/COMMIT.txt"
+          Copy-Item bundle-build.log $out
+          $missing = @('d3d12_x.dll', 'd3d12_xs.dll', 'xg_x.dll', 'xmem.dll', 'dxcompiler_x.dll', 'tombox-launch.exe') | Where-Object { -not (Test-Path (Join-Path $out $_)) }
+          "missing: $($missing -join ', ')" | Tee-Object -FilePath "$out/MISSING.txt"
+          Get-ChildItem $out | Measure-Object -Property Length -Sum | ForEach-Object { "files=$($_.Count) bytes=$($_.Sum)" }
+          Select-String -Path bundle-build.log -Pattern '^error' | Select-Object -First 40 | ForEach-Object { $_.Line }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tombox-runtime-windows-x64
+          path: tombox-runtime
+          retention-days: 14

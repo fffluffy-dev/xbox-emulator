@@ -1,0 +1,13 @@
+[package]
+name = "tombox-launch"
+version = "0.1.0"
+edition = "2021"
+description = "Stages a dumped Xbox GDK title for the runtime (overlay of the package, runtime DLLs beside the executable, TOMBOX_* environment) and launches it natively on Windows or through Wine / Proton elsewhere."
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "tombox-launch"
+path = "src/main.rs"
+
+[dependencies]
+tombox-pe = { path = "../../tombox-pe" }

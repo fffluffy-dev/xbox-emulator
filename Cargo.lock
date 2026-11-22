@@ -636,6 +636,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tombox-launch"
+version = "0.1.0"
+dependencies = [
+ "tombox-pe",
+]
+
+[[package]]
 name = "tombox-pe"
 version = "0.1.0"
 
