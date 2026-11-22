@@ -296,10 +296,9 @@ fn mesh_scalar_buffer_load_uses_root_descriptor_for_aliased_register() {
     let mut words = vec![sop1(3, 0, 16), sop1(3, 28, 0), 0xf420_000e, 0xfa00_0000];
     words.extend(console_ms(3, 1, 0));
     let mut shader = ms(&words, mesh_info(128, 128, 128, 2), pos_param_outs());
-    let Err(error) = translate(&shader) else {
-        panic!("a scalar buffer load requires a known root descriptor");
-    };
-    assert!(error.contains("missing root signature for base s28 (root s16)"), "{error}");
+    let mem = translate(&shader).expect("memory-descriptor fallback without a root signature");
+    assert!(mem.mem_user_data && mem.hlsl.contains("tb_gmem_load"), "{}", mem.hlsl);
+    dxc::compile(&mem.hlsl, &dxc::profile_for(mem.profile)).unwrap_or_else(|e| panic!("{e}\n{}", mem.hlsl));
 
     shader.has_root_sig = true;
     shader.root_sig = Some(RootSig {
@@ -355,7 +354,7 @@ fn mesh_root_signature_inference_binds_scalar_buffer_load() {
     let mut words = vec![sop1(3, 0, 16), sop1(3, 28, 0), 0xf420_000e, 0xfa00_0000];
     words.extend(console_ms(3, 1, 0));
     let mut shader = ms(&words, mesh_info(128, 128, 128, 2), pos_param_outs());
-    assert!(translate(&shader).is_err());
+    assert!(translate(&shader).expect("memory-descriptor fallback").mem_user_data);
     let sig = tombox_xshader::infer_root_signature(&shader).expect("inferred root signature");
     assert_eq!(sig.params.len(), 1);
     match &sig.params[0].kind {

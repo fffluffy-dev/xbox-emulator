@@ -491,7 +491,7 @@ fn memory_descriptors_load_through_the_global_windows() {
         "s16 = tb_user[4].x",
         "s17 = tb_user[4].y",
         "+ 0x20u + 0u;",
-        "<= s6) ? tb_gmem_load(tb_gva(s4, s5 & 0xffffu, t1o + 0u, 0)) : 0u;",
+        "<= s6) ? tb_gmem_load(tb_gva(s4, s5 & 0xffffu, t1o + 0u, 0), 4u) : 0u;",
         "(s5 >> 16) & 0x3fffu;",
         "tb_gmem_store(tb_gva(s4, s5 & 0xffffu",
     ] {

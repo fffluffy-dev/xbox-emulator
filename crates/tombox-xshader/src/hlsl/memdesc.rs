@@ -108,7 +108,7 @@ impl Emitter<'_> {
         self.tmp += 1;
         self.line(&format!("uint t{t}a = {} + {:#x}u + {so}; uint t{t}h = ({} & 0xffffu) + (t{t}a < {} ? 1u : 0u);", r(&lo)?, ins.aux.imm as u32 & 0x1f_ffff, r(&hi)?, r(&lo)?));
         for k in 0..n {
-            self.line(&format!("uint t{t}_{k} = tb_gmem_load(tb_gva(t{t}a, t{t}h, {}u, 0));", 4 * k));
+            self.line(&format!("uint t{t}_{k} = tb_gmem_load(tb_gva(t{t}a, t{t}h, {}u, 0), 4u);", 4 * k));
         }
         for k in 0..n {
             let o = sgpr(d + k as u8);
@@ -141,7 +141,7 @@ impl Emitter<'_> {
         self.line(&format!("uint t{t}o = {:#x}u + {so};", ins.aux.imm as u32 & 0x1f_ffff));
         for k in 0..n {
             self.line(&format!(
-                "uint t{t}_{k} = (t{t}o + {e}u <= {nr}) ? tb_gmem_load(tb_gva({lo}, {hi} & 0xffffu, t{t}o + {b}u, 0)) : 0u;",
+                "uint t{t}_{k} = (t{t}o + {e}u <= {nr}) ? tb_gmem_load(tb_gva({lo}, {hi} & 0xffffu, t{t}o + {b}u, 0), 4u) : 0u;",
                 e = 4 * k + 4,
                 b = 4 * k,
                 nr = r(&vs[2])?,
@@ -239,7 +239,7 @@ impl Emitter<'_> {
             if store {
                 self.line(&format!("if ((exec_lo & 1u) != 0u && t{t}k) tb_gmem_store({addr}, {});", r(&data)?));
             } else {
-                self.line(&format!("uint t{t}_{k} = t{t}k ? tb_gmem_load({addr}) : 0u;"));
+                self.line(&format!("uint t{t}_{k} = t{t}k ? tb_gmem_load({addr}, 4u) : 0u;"));
             }
         }
         if !store {

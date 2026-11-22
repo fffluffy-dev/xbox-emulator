@@ -598,8 +598,11 @@ fn image_mimg_unorm_a16_and_refusals() {
     run_mem_cases("mimg_unorm_a16", &cs);
 
     let mimg_base = mimg(0x27, 0xf, 1, 1, 4, 0, 12);
+    let mut pre = Prog::new();
+    pre.vv(1, fb(0.5)).vv(2, fb(0.5)).vv(3, fb(0.0));
+    let tfe = build(&pre, &[mimg_base[0] | (1 << 16), mimg_base[1]], 4, 4, false);
+    translate(&extract(&tfe, false)).expect("a sample with TFE translates (status VGPR 0)");
     for (bad_op, needle) in [
-        ([mimg_base[0] | (1 << 16), mimg_base[1]], "TFE"),
         ([mimg_base[0] | (1 << 17), mimg_base[1]], "LWE"),
         (unorm(mimg(0x27, 0xf, 3, 1, 4, 0, 12)), "cube"),
     ] {
