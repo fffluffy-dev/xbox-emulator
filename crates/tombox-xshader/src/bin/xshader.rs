@@ -111,6 +111,12 @@ fn main() -> ExitCode {
             println!("    param[{i}] vis={} {:?}", p.visibility, p.kind);
         }
     }
+    if let Some(rt) = tombox_xshader::meta::fssm_root_table(&ex.fssm) {
+        println!("  fssm root table: userSgprs={} entries={}", rt.user_sgprs, rt.entries.len());
+        for (i, e) in rt.entries.iter().enumerate() {
+            println!("    fssm[{i}] {:?} param={} userSgpr={} offset={} count={} reg={}", e.kind, e.root_param, e.user_sgpr, e.offset_dwords, e.count, e.register);
+        }
+    }
     println!("--- RDNA2 disassembly ---");
     let insns = tombox_xshader::rdna2::disassemble(&ex.isa);
     let mut consumed = 0usize;
