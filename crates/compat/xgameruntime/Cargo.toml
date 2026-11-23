@@ -2,7 +2,7 @@
 name = "xgameruntime"
 version = "0.1.0"
 edition = "2021"
-description = "Stand-in xgameruntime.dll for hosts without Microsoft's Gaming Runtime (Wine / Proton): the five dispatcher entry points, with QueryApiImpl answering E_NOINTERFACE so the compat-common GDK runtime that hooks it serves every interface it emulates."
+description = "Stand-in xgameruntime.dll for hosts without Microsoft's Gaming Runtime (Wine / Proton): the dispatcher entry points, with QueryApiImpl answering E_NOINTERFACE so the compat-common GDK runtime that hooks it serves every interface it emulates."
 license = "GPL-3.0-or-later"
 build = "build.rs"
 

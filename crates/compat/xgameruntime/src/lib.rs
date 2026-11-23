@@ -24,6 +24,19 @@ pub extern "system" fn InitializeApiImplEx(_gdk_version: u64, _game_os_version: 
 }
 
 #[no_mangle]
+pub extern "system" fn InitializeApiImplEx2(_gdk_version: u64, _game_os_version: u64, _options: usize, _reserved: usize) -> i32 {
+    S_OK
+}
+
+#[no_mangle]
+pub extern "system" fn XGameRuntimeInitialize() -> i32 {
+    S_OK
+}
+
+#[no_mangle]
+pub extern "system" fn XGameRuntimeUninitialize() {}
+
+#[no_mangle]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "system" fn QueryApiImpl(provider: *const Guid, iid: *const Guid, out: *mut *mut c_void) -> i32 {
     if provider.is_null() || iid.is_null() || out.is_null() {
@@ -57,6 +70,9 @@ mod tests {
     fn initialize_and_teardown_succeed() {
         assert_eq!(InitializeApiImpl(0x2306_0000_0000_0000, 0), S_OK);
         assert_eq!(InitializeApiImplEx(0, 0, 0), S_OK);
+        assert_eq!(InitializeApiImplEx2(0, 0, 0, 0), S_OK);
+        assert_eq!(XGameRuntimeInitialize(), S_OK);
+        XGameRuntimeUninitialize();
         UninitializeApiImpl();
         XErrorReport(E_NOINTERFACE, c"x".as_ptr().cast());
     }
@@ -64,7 +80,7 @@ mod tests {
     #[test]
     fn exports_txt_names_every_entry_point_once() {
         let names: Vec<String> = xone_exports_names();
-        assert_eq!(names, ["InitializeApiImpl", "InitializeApiImplEx", "QueryApiImpl", "UninitializeApiImpl", "XErrorReport"]);
+        assert_eq!(names, ["InitializeApiImpl", "InitializeApiImplEx", "QueryApiImpl", "UninitializeApiImpl", "XErrorReport", "InitializeApiImplEx2", "XGameRuntimeInitialize", "XGameRuntimeUninitialize"]);
     }
 
     fn xone_exports_names() -> Vec<String> {
