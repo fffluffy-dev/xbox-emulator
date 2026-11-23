@@ -28,9 +28,9 @@ Uses legally obtained, already-decrypted dumps of games you own. The project doe
 | Area | State |
 |---|---|
 | Imported system functions (Fortnite EXE) | 671 / 671 covered |
-| Direct3D 12.x interface methods | 192 / 200 (8 partial: Device 29, 44; CommandList 64, 70, 74, 85, 86, 101) |
-| RDNA2 instructions verified | 787 / 794 |
-| Xbox console library exports | 2,145 / 2,155 |
+| Direct3D 12.x interface methods | 200 / 200 |
+| RDNA2 instructions verified | 813 / 820 |
+| Xbox console library exports | 2,147 / 2,155 |
 | Full shader sweep of the tested titles | 105,506 / 105,506 translate |
 | Shaders without a root signature (GTA VI mesh programs) | **New:** buffers *and* images / samplers translate in memory-descriptor mode; runtime side not wired yet |
 | Translator checked on real GPUs | **New:** GitHub Actions (Windows, WARP + DXC) and a Steam Deck (RDNA2, Proton / vkd3d-proton / RADV) |
@@ -47,10 +47,10 @@ Uses legally obtained, already-decrypted dumps of games you own. The project doe
 | Title | Build | Result |
 |---|---|---|
 | Fortnite (Chapter 2 Season 4) | 2.0.1461.7919 | Boots, logs in to a local backend, reaches the Battle Royale lobby. 2D interface correct; 3D scene lit but materials wrong, bloom artifacts. No audio, no input. Not playable. |
-| Trackmania | Xbox One build | Title menu draws at 144 fps. Open: xg_x HTILE / metadata planes, stencil-only MSAA views. |
-| Terraria | Xbox One build | Runs 60 s without crashing; no frame yet (textures get GPU VA 0, Unity waits on the upload). |
-| XDefiant | Series build | Runs about 140 s at 60 fps, frame black: aliased-VA render targets need shared backing. Parked. |
-| Minecraft | GDK build | Imports analysed and GDK slots verified; not brought up. |
+| Trackmania | 1.6.2.0 | **Boots and plays on the upstream developers' PC:** menus, login against the in-process backend, the Training - 01 race at about 60 fps, keyboard and controller. Video screens, billboards and streamed textures are black; stencil-tested lighting is dark. **Steam Deck (Proton, through `tombox-launch`):** the runtime, D3D12 device, shader translation and PSOs come up, then a null sub-object crashes it before the first frame (see docs/HANDOFF.md). |
+| Terraria | 4.4.14.1081 | **Reaches its world** at 60 fps; keyboard and controller work when played by hand. Automated runs still crash some seconds after the world appears. |
+| XDefiant | 1.0.0.186 | Boots to first frames (~26 s) at under 1 fps while shader and pipeline compiles block, then crashes. |
+| Minecraft (Beta) | 1.18.3064.0 | Boots past the welcome screen to the menu (~44 s), then crashes in automated runs. |
 | Grand Theft Auto VI | 1.0.2.1 | **Not run: no executable exists in any dump.** Shader package examined (26,503 shaders). The blocker that stopped two thirds of them, resources bound without a root signature, now has a translator answer (memory-descriptor mode); the rest of the road is in the [roadmap](docs/ROADMAP.md). |
 
 ## What changed in the last round
@@ -77,7 +77,7 @@ The full plan, with what blocks each step, is in **[docs/ROADMAP.md](docs/ROADMA
 
 1. **Land the open pull requests** and keep CI green.
 2. **Finish the GTA VI resource model:** the d3d12_xs runtime fills the user data, maps memory windows and keeps the T# / S# table (memory-descriptor step 3).
-3. **Make a second title playable:** Trackmania past the menu, Terraria to its first frame, XDefiant out of the black frame, with audio and input.
+3. **More titles playable:** Trackmania already plays on the upstream PC; next are its black video and stencil passes, Terraria past its automated-run crash, XDefiant past its first frames, and Trackmania on the Steam Deck.
 4. **Fortnite in game:** correct 3D materials, audio, controller and keyboard.
 5. **GTA VI:** everything that can be done without an executable now; boot when one exists.
 

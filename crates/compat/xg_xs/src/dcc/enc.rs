@@ -128,9 +128,53 @@ pub(crate) fn relay(d: &mut Dcc, dst: usize, src: usize, mode: u32) -> Result<()
     relay_in(d, dst, src, mode, &mut Tmp::new())
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct RelayG {
+    pub(crate) b: [u8; 64],
+    pub(crate) known: [bool; 64],
+}
+
+pub(crate) static RELAY_G: std::sync::Mutex<RelayG> = std::sync::Mutex::new(RelayG { b: [0; 64], known: [true; 64] });
+
+pub(crate) fn relay_g() -> RelayG {
+    *RELAY_G.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(crate) fn set_relay_g(g: RelayG) {
+    *RELAY_G.lock().unwrap_or_else(|e| e.into_inner()) = g;
+}
+
+pub(crate) fn relay_g_lost() {
+    if crate::dcc::xg_build() == 19041 {
+        RELAY_G.lock().unwrap_or_else(|e| e.into_inner()).known = [false; 64];
+    }
+}
+
 pub(crate) fn relay_in(d: &mut Dcc, dst: usize, src: usize, mode: u32, t: &mut Tmp) -> Result<(), i32> {
     let from = d.r32(0xf0);
-    lay_in(d, dst, src, &[Some((from, mode)); 4], t)?;
+    if crate::dcc::xg_build() == 19041 {
+        let holes = relay_holes(d, mode);
+        let last = (0..4u32).rev().find(|&k| (d.r32(0x5c) >> k) & 1 != 0);
+        let mut written = [last.is_some(); 64];
+        if let Some(last) = last {
+            for &h in &holes {
+                if h / 64 == last as usize {
+                    written[h % 64] = false;
+                }
+            }
+        }
+        let g = relay_g();
+        let mut gt = Tmp { b: g.b, ever: g.known, fill: t.fill, hit: false };
+        lay_in(d, dst, src, &[Some((from, mode)); 4], &mut gt)?;
+        t.hit |= gt.hit;
+        let mut known = g.known;
+        for p in 0..64 {
+            known[p] |= written[p];
+        }
+        set_relay_g(RelayG { b: gt.b, known });
+    } else {
+        lay_in(d, dst, src, &[Some((from, mode)); 4], t)?;
+    }
     d.w32(0xf0, mode);
     Ok(())
 }

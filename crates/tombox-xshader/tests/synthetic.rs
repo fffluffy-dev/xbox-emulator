@@ -46,6 +46,7 @@ fn shader(stage: Stage, words: &[u32], input_sig: Vec<SigElement>, output_sig: V
         has_root_sig: root.is_some(),
         input_sig,
         output_sig,
+        prim_sig: Vec::new(),
         resources: Vec::new(),
         gs_info: None,
         root_sig: root,
@@ -882,5 +883,55 @@ fn raw_uav_buffer_atomics_share_ubuf_instead_of_overlapping_utb() {
     if tombox_xshader::dxc::available() {
         let profile = tombox_xshader::dxc::profile_for(t.profile);
         tombox_xshader::dxc::compile(&t.hlsl, &profile).expect("DXC compile");
+    }
+}
+
+#[test]
+fn unmapped_position_export_without_clip_or_cull_distance_is_ignored() {
+    let words = [
+        EXP_POS0_V0_V3[0], EXP_POS0_V0_V3[1],
+        0xf800_08df, 0x0302_0100,
+        S_ENDPGM,
+    ];
+    let position = || vec![sig("SV_Position", 1, 3, 0, 0xf)];
+    let ex = shader(Stage::Vertex, &words, vec![], position(), None);
+    let t = translate(&ex).expect("translate position export 13 without clip or cull distance");
+    assert!(t.hlsl.contains("o.o0 ="), "{}", t.hlsl);
+    #[cfg(windows)]
+    if tombox_xshader::dxc::available() {
+        let profile = tombox_xshader::dxc::profile_for(t.profile);
+        tombox_xshader::dxc::compile(&t.hlsl, &profile).expect("DXC compile");
+    }
+}
+
+#[test]
+fn image_atomic_64bit_emits_uint64_uav_and_sm66() {
+    let words = [
+        0xf40c_0004, 0xfa00_0000,
+        0x7e02_0284,
+        0x7e04_0285,
+        0x7e06_0286,
+        0x7e08_0287,
+        0xf05c_1308, 0x0000_0301,
+        0xf800_1890, 0x0000_0000,
+        S_ENDPGM,
+    ];
+    let root = RootSig {
+        version: 2,
+        flags: 0,
+        params: vec![table(1, 16, 0)],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    };
+    let ex = shader(Stage::Pixel, &words, vec![], vec![], Some(root));
+    let t = translate(&ex).expect("64-bit image_atomic_umax");
+    assert_eq!(t.profile, "ps_6_6");
+    assert!(t.uses_typed_atomic64);
+    assert!(t.hlsl.contains("RWTexture2D<uint64_t> uav0"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("InterlockedMax(uav0[uint2(v1, v2)], (((uint64_t)v4 << 32) | (uint64_t)v3)"), "{}", t.hlsl);
+    #[cfg(windows)]
+    if tombox_xshader::dxc::available() {
+        let profile = tombox_xshader::dxc::profile_for(t.profile);
+        tombox_xshader::dxc::compile(&t.hlsl, &profile).expect("DXC compile ps_6_6");
     }
 }

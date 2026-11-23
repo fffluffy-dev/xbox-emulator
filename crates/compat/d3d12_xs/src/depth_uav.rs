@@ -673,6 +673,7 @@ pub unsafe fn barriers(list: *mut c_void, n: u32, barriers: *const u8, real: uns
 }
 
 unsafe fn run_pass(list: *mut c_void, p: &Pair, copy_in: bool) {
+    let _ij = unsafe { crate::inject::scope(list, crate::inject::DETILE) };
     let Some(ps) = PASS.get().and_then(|r| r.as_ref().ok()) else { return };
     static LOG: AtomicUsize = AtomicUsize::new(0);
     if crate::cl2_state::active_queries(list) > 0 && LOG.fetch_add(1, Ordering::Relaxed) < 4 {

@@ -562,6 +562,8 @@ fn div_scale_and_fixup_f64() {
 }
 
 mod basic;
+mod fract;
 mod lanes;
 mod leonida;
+mod rdna2_silicon;
 mod vopc;

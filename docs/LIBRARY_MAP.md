@@ -26,23 +26,23 @@ Upstream's metric set (same definitions as upstream `tools/progress/gen.py`, For
 | Metric | Done | Total | % |
 |---|---|---|---|
 | system_functions | 671 | 671 | 100.0 |
-| d3d12x_methods | 192 | 200 | 96.0 |
-| rdna2_instructions | 787 | 794 | 99.12 |
+| d3d12x_methods | 200 | 200 | 100.0 |
+| rdna2_instructions | 813 | 820 | 99.15 |
 | shaders_translated | 105506 | 105506 | 100.0 |
 | shader_stages | 0 | 8 | 0.0 |
-| milestones | 9 | 18 | 50.0 |
+| milestones | 13 | 18 | 72.22 |
 | titles_examined | 6 | - | - |
-| console_exports | 2145 | 2155 | 99.54 |
+| console_exports | 2147 | 2155 | 99.63 |
 | shader_compile_lobby_frame | 139 | 139 | 100.0 |
 | shader_compile_fixtures | 25 | 25 | 100.0 |
 | shader_compile_full_sweep | not published | 105506 | - |
-| milestones_verified_this_machine | 7 | 12 | 58.33 |
+| milestones_verified_this_machine | 10 | 12 | 83.33 |
 | title_imports_Fortnite | 50 | 50 | 100.0 |
 | title_imports_XDefiant | 52 | 52 | 100.0 |
 | title_imports_Terraria | 61 | 61 | 100.0 |
 | title_imports_Trackmania | 48 | 48 | 100.0 |
 | title_imports_Minecraft | 35 | 35 | 100.0 |
-| console_exports_targeted | 2145 | 2154 | 99.58 |
+| console_exports_targeted | 2147 | 2154 | 99.68 |
 | console_exports_not_targeted | not published | 1 | - |
 
 Shader compile: all 139 shaders of the lobby frame compile with DXC (TomBox `docs/DEVELOPMENT_LOG.md:894`); 25/25 fixtures compile (`:672`). The full-library compile sweep (`:706`) has no published final count, so no compile badge is shown.
@@ -1112,7 +1112,7 @@ Console-related exports of the DLLs in each title's EmbeddedXvd `Windows\System3
 | xfp_gc.dll | System32 | no | 8 | 8 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xfrontpaneldisplay.dll | System32 | no | 8 | 8 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 6 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xg_x.dll | System32 | no | 21 | 21 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 4 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
-| xg_xs.dll | System32 | no | 23 | 21 | 0 | 0 | 0 | 0 | 0 | 2 | 0 | 0 | 0 | 1 | 1 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
+| xg_xs.dll | System32 | no | 23 | 23 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 1 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xgs12.dll | System32 | no | 17 | 17 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xgs12_10.dll | System32 | no | 21 | 21 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
 | xgs12_10d.dll | System32 | no | 21 | 21 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | Fortnite 10.0.19041.3948; XDefiant 10.0.22000.4429; Terraria 10.0.22000.4429; Trackmania 10.0.22621.1852 |
@@ -1135,7 +1135,7 @@ Console-related exports of the DLLs in each title's EmbeddedXvd `Windows\System3
 
 ### Not targeted (no analysed title references them)
 
-The console-library total above (2155 exports in 110 libraries) keeps every console-only export in the denominator, including devkit, tools and OS service DLLs that no analysed title imports. 109 libraries (2154 exports) are imported by at least one title, directly or through API-set host attribution, or are emulator-provided; the 1 below (1 exports) are not targeted: no title EXE or shipped DLL imports any of their exports and the emulator does not provide them. They stay `missing` in the headline instead of being dropped from it, so the percentage is not inflated; a library moves out of this list as soon as a title imports it or an emulator crate exports it. The earlier Xbox-only figure (2078 exports) counted only DLLs with no same-named PC DLL and is kept in `summary.json` under `all_including_pc`. Coverage inside the 109 targeted libraries alone: 2145/2154.
+The console-library total above (2155 exports in 110 libraries) keeps every console-only export in the denominator, including devkit, tools and OS service DLLs that no analysed title imports. 109 libraries (2154 exports) are imported by at least one title, directly or through API-set host attribution, or are emulator-provided; the 1 below (1 exports) are not targeted: no title EXE or shipped DLL imports any of their exports and the emulator does not provide them. They stay `missing` in the headline instead of being dropped from it, so the percentage is not inflated; a library moves out of this list as soon as a title imports it or an emulator crate exports it. The earlier Xbox-only figure (2078 exports) counted only DLLs with no same-named PC DLL and is kept in `summary.json` under `all_including_pc`. Coverage inside the 109 targeted libraries alone: 2147/2154.
 
 | Library | Folder | Same-named PC DLL | Console-only exports | Present in |
 |---|---|---|---|---|
@@ -4046,7 +4046,7 @@ No PC DLL is named minuserx.dll; it is emulated by its compat crate, so no row i
 
 </details>
 
-<details><summary><b>xg_xs.dll</b>: 23 console-only exports, 21 covered</summary>
+<details><summary><b>xg_xs.dll</b>: 23 console-only exports, 23 covered</summary>
 
 | Function | Status | Imported by | Present in |
 |---|---|---|---|
@@ -4063,7 +4063,9 @@ No PC DLL is named minuserx.dll; it is emulated by its compat crate, so no row i
 | `XGCreateTexture3DComputer` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGCreateTextureComputer` | implemented | Fortnite | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGCreateTextureComputerFromDescriptor` | implemented | XDefiant | Fortnite, XDefiant, Terraria, Trackmania |
+| `XGDecodeDCC` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGEnableExclusiveLocking` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
+| `XGEncodeDCC` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGEnterExclusiveLock` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGInitializeLibrary` | implemented |  | XDefiant, Terraria, Trackmania |
 | `XGLeaveExclusiveLock` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
@@ -4071,8 +4073,6 @@ No PC DLL is named minuserx.dll; it is emulated by its compat crate, so no row i
 | `XGTerminateLibrary` | implemented |  | XDefiant, Terraria, Trackmania |
 | `XGValidateDepthStencilSwizzleMode` | implemented |  | Fortnite, XDefiant, Terraria, Trackmania |
 | `XGValidateDescriptor` | implemented |  | XDefiant, Terraria, Trackmania |
-| `XGDecodeDCC` | stub |  | Fortnite, XDefiant, Terraria, Trackmania |
-| `XGEncodeDCC` | stub |  | Fortnite, XDefiant, Terraria, Trackmania |
 
 </details>
 
@@ -4503,22 +4503,22 @@ No PC DLL is named minuserx.dll; it is emulated by its compat crate, so no row i
 
 </details>
 
-## Verified on this machine (Fortnite)
+## Verified on this machine (running titles)
 
 | Milestone | Evidence |
 |---|---|
-| Boots (process starts, GDK runtime services up) | `%TEMP%\tombox\run.txt:1-4` |
-| First frames (PresentX into the title window) | `%TEMP%\tombox\tombox_compat.log:14540` |
-| Window clamped to the primary monitor | `%TEMP%\tombox\tombox_compat.log:12987` |
-| Login complete (HandleLoginRequestComplete Result=2) | `%TEMP%\tombox\run.txt:5962` |
-| Hotfix check UpdateSuccess | `%TEMP%\tombox\run.txt:3401,6094` |
-| Game-mode select (UI.State.Startup.SubgameSelect) | `%TEMP%\tombox\run.txt:6249` |
-| Battle Royale lobby (UI.State.Athena.Frontend) | `%TEMP%\tombox\run.txt:6496` |
-| 3D scene correct | not reached |
-| Keyboard / controller input | not reached |
-| Audio | not reached |
-| Gameplay | not reached |
-| A second title running | not reached |
+| Fortnite: Boots (process starts, GDK runtime services up) | `%TEMP%\tombox\run.txt:1-4` |
+| Fortnite: First frames (PresentX into the title window) | `%TEMP%\tombox\tombox_compat.log:14540` |
+| Fortnite: Window clamped to the primary monitor | `%TEMP%\tombox\tombox_compat.log:12987` |
+| Fortnite: Login complete (HandleLoginRequestComplete Result=2) | `%TEMP%\tombox\run.txt:5962` |
+| Fortnite: Hotfix check UpdateSuccess | `%TEMP%\tombox\run.txt:3401,6094` |
+| Fortnite: Game-mode select (UI.State.Startup.SubgameSelect) | `%TEMP%\tombox\run.txt:6249` |
+| Fortnite: Battle Royale lobby (UI.State.Athena.Frontend) | `%TEMP%\tombox\run.txt:6496` |
+| Trackmania: keyboard / controller input (host pad and keyboard drive the menus to the campaign map; user session 2026-11-22) | `TomBox tools/dev/batch_runs/user_play_r32b/run.txt (init challenge 'Training - 01', 'Training - 02', 'Spring 2024 - 01')` |
+| Trackmania: gameplay (drives Training - 01 at ~60 fps avg, loads campaign Spring 2024 - 01) | `TomBox tools/dev/batch_runs/fast_20261122_223736_trackmania_r32_batch_control_warm2/result.json; TomBox tools/dev/batch_runs/user_play_r32b/run.txt` |
+| Second title running: Trackmania and Terraria (Terraria reaches its world at 60 fps) | `TomBox tools/dev/batch_runs/fast_20261122_201135_terraria_tr_default_copy2/result.json` |
+| 3D scene correct | not reached: Trackmania renders its races, but video and streamed textures stay black (CPU writes into GPU memory are not mirrored yet) and the stencil-tested lighting passes are dark |
+| Audio | in progress: XAudio2 engine creation and XMA2 source-voice wrapping verified 2026-11-22 (Trackmania); audible output not verified since test runs are muted |
 
 ## Unverified
 

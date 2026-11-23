@@ -144,7 +144,7 @@ fn ufloat(bits: u32, mant_bits: u32) -> f32 {
 }
 
 /// Decode one pixel to up to four floats. Returns (channels, is_float_or_depth, bytes/pixel).
-fn layout(fmt: u32) -> Option<(usize, bool, usize, &'static str)> {
+pub(crate) fn layout(fmt: u32) -> Option<(usize, bool, usize, &'static str)> {
     Some(match fmt {
         1..=2 => (4, true, 16, "rgba32f"),
         9..=10 => (4, true, 8, "rgba16f"),
@@ -168,7 +168,7 @@ fn layout(fmt: u32) -> Option<(usize, bool, usize, &'static str)> {
     })
 }
 
-fn decode(kind: &str, p: &[u8]) -> [f32; 4] {
+pub(crate) fn decode(kind: &str, p: &[u8]) -> [f32; 4] {
     let u16at = |o: usize| u16::from_le_bytes([p[o], p[o + 1]]);
     let u32at = |o: usize| u32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]);
     let f32at = |o: usize| f32::from_bits(u32at(o));
@@ -602,6 +602,12 @@ pub fn note_view(handle: usize, res: usize, rtv_increment: usize) {
         }
     });
 }
+pub fn view_of(handle: usize) -> Option<usize> {
+    with_trace(|t| t.views.get(&handle).copied())
+}
+pub fn rtv_increment() -> usize {
+    with_trace(|t| t.rtv_increment)
+}
 pub fn note_compute_pso(pso: usize, code: usize) {
     with_trace(|t| {
         t.compute.insert(pso, code);
@@ -626,6 +632,10 @@ pub unsafe fn on_set_targets(list: usize, n: u32, handles: *const usize, single_
         s.dsv = d;
     });
 }
+pub fn bound_vbs(list: usize) -> Vec<(u32, u64, u32, u32)> {
+    with_trace(|t| t.vbs.get(&list_key(list)).cloned().unwrap_or_default())
+}
+
 pub unsafe fn on_set_vbs(list: usize, start: u32, n: u32, views: *const u8) {
     with_trace(|t| {
         let v = t.vbs.entry(list_key(list)).or_default();
@@ -644,6 +654,10 @@ pub unsafe fn on_set_vbs(list: usize, start: u32, n: u32, views: *const u8) {
 /// Log one traced draw or dispatch (see `trace_hashes`): its arguments, vertex buffers and
 /// everything bound through descriptor tables (constant-buffer contents included).
 pub fn trace_draw(list: usize, compute: bool, text: &str) {
+    if !compute && crate::fmask_check::armed() {
+        let pso = with_trace(|t| t.lists.get(&list_key(list)).map(|s| s.pso).unwrap_or(0));
+        crate::fmask_check::on_draw(list, pso);
+    }
     let line = with_trace(|t| {
         if t.trace_hashes.is_empty() || t.trace_budget == 0 {
             return None;
@@ -972,7 +986,7 @@ pub fn end_frame(captured_into: Option<&std::path::Path>) {
         if t.trace_hashes != tl {
             t.trace_hashes = tl;
             t.trace_pso.clear();
-            t.trace_budget = 48;
+            t.trace_budget = std::env::var("TOMBOX_RTCAP_TRACE_BUDGET").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(48);
         }
     });
     if let Some(dir) = captured_into {
