@@ -19,14 +19,39 @@ pub struct NlHint {
     pub roaming: u8,
 }
 
-#[link(name = "iphlpapi")]
 extern "system" {
-    fn GetNetworkConnectivityHint(hint: *mut NlHint) -> u32;
+    fn LoadLibraryA(name: *const u8) -> *mut c_void;
+    fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+}
+
+type HintFn = unsafe extern "system" fn(*mut NlHint) -> u32;
+
+fn system_hint_fn() -> Option<HintFn> {
+    static F: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let f = *F.get_or_init(|| unsafe {
+        let m = LoadLibraryA(b"iphlpapi.dll\0".as_ptr());
+        if m.is_null() { 0 } else { GetProcAddress(m, b"GetNetworkConnectivityHint\0".as_ptr()) as usize }
+    });
+    (f != 0).then(|| unsafe { core::mem::transmute::<usize, HintFn>(f) })
 }
 
 pub fn system_hint() -> Option<NlHint> {
+    let f = system_hint_fn()?;
     let mut h = NlHint::default();
-    if unsafe { GetNetworkConnectivityHint(&mut h) } == 0 { Some(h) } else { None }
+    if unsafe { f(&mut h) } == 0 { Some(h) } else { None }
+}
+
+pub fn title_hint() -> NlHint {
+    let sys = system_hint();
+    NlHint { level: connectivity_level(), cost: sys.map(|h| h.cost).filter(|c| *c != 0).unwrap_or(1), ..sys.unwrap_or_default() }
+}
+
+pub unsafe extern "system" fn get_network_connectivity_hint(out: *mut NlHint) -> u32 {
+    if out.is_null() {
+        return 87;
+    }
+    core::ptr::write_unaligned(out, title_hint());
+    0
 }
 
 pub fn connectivity_level() -> u32 {

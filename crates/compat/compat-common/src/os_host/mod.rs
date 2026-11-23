@@ -29,6 +29,7 @@ const AFF_DLLS: &[&str] = &["api-ms-win-core-processtopology-", "kernel32.dll", 
 const THREAD_DLLS: &[&str] = &["api-ms-win-core-processthreads-", "kernel32.dll", "kernelbase.dll"];
 const DIR_DLLS:&[&str] = &["api-ms-win-core-kernel32-legacy-", "api-ms-win-core-libraryloader-", "kernel32.dll", "kernelbase.dll"];
 const PLM_DLLS: &[&str] = &["twinapi.appcore.dll", "kernel.appcore.dll"];
+const IPHLP_DLLS: &[&str] = &["iphlpapi.dll"];
 
 pub unsafe fn resolve(dll: &str, func: &str) -> *mut c_void {
     let w: Vec<u16> = dll.encode_utf16().chain(Some(0)).collect();
@@ -56,6 +57,7 @@ pub fn hooks() -> Vec<Hook> {
         Hook { name: "UnregisterAppStateChangeNotification", dlls: PLM_DLLS, hook: plm::unregister_app_state_change_notification as *const () as usize },
         Hook { name: "RegisterAppConstrainedChangeNotification", dlls: PLM_DLLS, hook: plm::register_app_constrained_change_notification as *const () as usize },
         Hook { name: "UnregisterAppConstrainedChangeNotification", dlls: PLM_DLLS, hook: plm::unregister_app_constrained_change_notification as *const () as usize },
+        Hook { name: "GetNetworkConnectivityHint", dlls: IPHLP_DLLS, hook: crate::gdk::net::get_network_connectivity_hint as *const () as usize },
     ]
 }
 
