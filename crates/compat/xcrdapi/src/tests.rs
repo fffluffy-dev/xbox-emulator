@@ -111,6 +111,7 @@ unsafe fn wait(a: *mut c_void, i: u32) -> i32 {
 #[test]
 fn iid_bytes_match_console_tables() {
     assert_eq!(IID_FACTORY_X, [0xac, 0x54, 0x3b, 0xfb, 0x82, 0xbf, 0x3a, 0x46, 0xb7, 0x77, 0x73, 0x19, 0x58, 0x37, 0x86, 0x4d]);
+    assert_eq!(iid_text(&IID_FACTORY_X_V2), "62959d11-d45f-4884-a0a3-f7862ea243ae");
     assert_eq!(iid_text(&IID_STATUS_ARRAY_X), "cd66d752-2786-44f7-9070-e2a6fdad3f1b");
     assert_eq!(iid_text(&IID_QUEUE_X), "a3f6649a-8c2c-4b3a-8b6e-10186a04b9bc");
     assert_eq!(iid_text(&IID_FILE_X), "43704f9f-27c6-4a9f-8815-d16527894df4");
@@ -518,4 +519,19 @@ fn fixed_result_exports_match_every_console_xcrdapi() {
     for (name, _, _) in ours {
         assert!(seen.get(name).copied().unwrap_or(0) >= 3, "{name} compared against {:?} console dumps", seen.get(name));
     }
+}
+
+#[test]
+fn factory_answers_the_second_console_factory_iid() {
+    let base = factory();
+    let mut f: *mut c_void = core::ptr::null_mut();
+    assert_eq!(unsafe { DStorageGetFactory(IID_FACTORY_X_V2.as_ptr() as *const c_void, &mut f) }, S_OK);
+    assert_eq!(f, base);
+    let qi: unsafe extern "system" fn(*mut c_void, *const c_void, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(slot(f, 0)) };
+    let mut g: *mut c_void = core::ptr::null_mut();
+    assert_eq!(unsafe { qi(f, IID_FACTORY_X.as_ptr() as *const c_void, &mut g) }, S_OK);
+    assert_eq!(g, base);
+    let mut h: *mut c_void = core::ptr::null_mut();
+    assert_eq!(unsafe { qi(f, IID_FILE_X.as_ptr() as *const c_void, &mut h) }, E_NOINTERFACE);
+    assert!(h.is_null());
 }
