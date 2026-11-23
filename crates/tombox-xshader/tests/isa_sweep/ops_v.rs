@@ -413,28 +413,14 @@ fn h1(s: &mut Suite, m: &'static str, op: u32, class: Class, cmp: Cmp, g: fn(u32
     s.add(m, "VOP1", "e64", class, &[vmov(OUT, v(12))], &vop3(0x180 + op, OUT, [v(11), 0, 0]), &[], &[cmp], move |x| on(g(x.d[1] & 0xffff).map(|r| (x.d[2] & 0xffff_0000) | (r & 0xffff))));
 }
 
+fn d1x(s: &mut Suite, m: &'static str, op: u32, i: usize) {
+    s.add(m, "VOP1", "e32", Class::F64, &[], &[vop1(op, OUT, v(10))], &[], &[Cmp::X, Cmp::X], move |x| o64(tombox_xshader::trans32::eval64(i, ((x.d[1] as u64) << 32) | x.d[0] as u64)));
+    s.add(m, "VOP1", "e64 neg", Class::F64, &[], &vop3o(0x180 + op, OUT, [v(12), 0, 0], 0, 1, false, 0), &[], &[Cmp::X, Cmp::X], move |x| o64(tombox_xshader::trans32::eval64(i, (((x.d[3] as u64) << 32) | x.d[2] as u64) ^ (1 << 63))));
+}
+
 fn d1(s: &mut Suite, m: &'static str, op: u32, cmp: Cmp, g: fn(f64) -> Option<u64>) {
     s.add(m, "VOP1", "e32", Class::F64, &[], &[vop1(op, OUT, v(10))], &[], &[cmp, Cmp::F64Hi], move |x| g(d(x.d[0], x.d[1])).map_or(vec![None, None], o64));
     s.add(m, "VOP1", "e64 neg", Class::F64, &[], &vop3o(0x180 + op, OUT, [v(12), 0, 0], 0, 1, false, 0), &[], &[cmp, Cmp::F64Hi], move |x| g(-d(x.d[2], x.d[3])).map_or(vec![None, None], o64));
-}
-
-fn trans_in(x: u32) -> bool {
-    den32(x)
-}
-
-fn tr(x: u32, r: f64) -> Option<u32> {
-    if trans_in(x) {
-        return None;
-    }
-    let y = r as f32;
-    if den32(y.to_bits()) {
-        return None;
-    }
-    Some(f32q(y))
-}
-
-fn rcp32(x: u32) -> Option<u32> {
-    tr(x, 1.0 / f(x) as f64)
 }
 
 fn frexp32(x: u32) -> (u32, u32) {
@@ -501,25 +487,6 @@ fn fract32(x: u32) -> Option<u32> {
     Some(r.min(f(0x3f7f_ffff)).to_bits())
 }
 
-fn sin_rev(x: u32, cos: bool) -> Option<u32> {
-    if !cos && x & 0x7fff_ffff == 0 {
-        return Some(x);
-    }
-    if trans_in(x) || nan32(x) {
-        return if nan32(x) { Some(QNAN32) } else { None };
-    }
-    let v = f(x) as f64;
-    if !v.is_finite() {
-        return Some(QNAN32);
-    }
-    if v.abs() > 256.0 {
-        return None;
-    }
-    let t = v - v.floor();
-    let a = 2.0 * std::f64::consts::PI * t;
-    Some(f32q(if cos { a.cos() } else { a.sin() } as f32))
-}
-
 fn vop1_ops(s: &mut Suite) {
     u1(s, "v_mov_b32", 0x01, Class::U32, |a| a);
     u1(s, "v_not_b32", 0x37, Class::U32, |a| !a);
@@ -549,14 +516,14 @@ fn vop1_ops(s: &mut Suite) {
     f1(s, "v_ceil_f32", 0x22, Class::F32, Cmp::F32(0), |a| if den32(a) { None } else { Some(f32q(f(a).ceil())) }, true);
     f1(s, "v_rndne_f32", 0x23, Class::F32, Cmp::F32(0), |a| Some(f32q(rne32(f(a)))), true);
     f1(s, "v_floor_f32", 0x24, Class::F32, Cmp::F32(0), |a| if den32(a) { None } else { Some(f32q(f(a).floor())) }, true);
-    f1(s, "v_exp_f32", 0x25, Class::Trans, Cmp::F32(2), |a| tr(a, 2f64.powf(f(a) as f64)), true);
-    f1(s, "v_log_f32", 0x27, Class::Trans, Cmp::F32Tol(2, 2.0e-7), |a| if f(a) == 0.0 { Some(0xff80_0000) } else if trans_in(a) { None } else { tr(a, (f(a) as f64).log2()) }, true);
-    f1(s, "v_rcp_f32", 0x2a, Class::Trans, Cmp::F32(1), rcp32, true);
-    f1(s, "v_rcp_iflag_f32", 0x2b, Class::Trans, Cmp::F32(1), rcp32, false);
-    f1(s, "v_rsq_f32", 0x2e, Class::Trans, Cmp::F32(1), |a| if f(a) == 0.0 { Some(if a >> 31 != 0 { 0xff80_0000 } else { 0x7f80_0000 }) } else { tr(a, 1.0 / (f(a) as f64).sqrt()) }, true);
-    f1(s, "v_sqrt_f32", 0x33, Class::Trans, Cmp::F32(1), |a| if f(a) == 0.0 { Some(a) } else { tr(a, (f(a) as f64).sqrt()) }, true);
-    f1(s, "v_sin_f32", 0x35, Class::Trans, Cmp::F32Tol(4, 4.0e-6), |a| sin_rev(a, false), true);
-    f1(s, "v_cos_f32", 0x36, Class::Trans, Cmp::F32Tol(4, 4.0e-6), |a| sin_rev(a, true), true);
+    f1(s, "v_exp_f32", 0x25, Class::Trans, Cmp::X, |a| Some(tombox_xshader::trans32::eval(5, a)), true);
+    f1(s, "v_log_f32", 0x27, Class::Trans, Cmp::X, |a| Some(tombox_xshader::trans32::eval(4, a)), true);
+    f1(s, "v_rcp_f32", 0x2a, Class::Trans, Cmp::X, |a| Some(tombox_xshader::trans32::eval(0, a)), true);
+    f1(s, "v_rcp_iflag_f32", 0x2b, Class::Trans, Cmp::X, |a| Some(tombox_xshader::trans32::eval(1, a)), false);
+    f1(s, "v_rsq_f32", 0x2e, Class::Trans, Cmp::X, |a| Some(tombox_xshader::trans32::eval(2, a)), true);
+    f1(s, "v_sqrt_f32", 0x33, Class::Trans, Cmp::X, |a| Some(tombox_xshader::trans32::eval(3, a)), true);
+    f1(s, "v_sin_f32", 0x35, Class::Trans, Cmp::X, |a| Some(tombox_xshader::trans32::eval(6, a)), true);
+    f1(s, "v_cos_f32", 0x36, Class::Trans, Cmp::X, |a| Some(tombox_xshader::trans32::eval(7, a)), true);
     f1(s, "v_frexp_exp_i32_f32", 0x3f, Class::F32, Cmp::X, |a| Some(frexp32(a).1), false);
     f1(s, "v_frexp_mant_f32", 0x40, Class::F32, Cmp::F32(0), |a| Some(frexp32(a).0), false);
     h1(s, "v_cvt_f16_u16", 0x50, Class::U32, Cmp::F16(0), |a| Some(d2h((a & 0xffff) as f64)));
@@ -595,9 +562,9 @@ fn vop1_ops(s: &mut Suite) {
     d1(s, "v_rndne_f64", 0x19, Cmp::F64(0), |a| Some(f64q(rne64(a))));
     d1(s, "v_floor_f64", 0x1a, Cmp::F64(0), |a| Some(f64q(a.floor())));
     d1(s, "v_fract_f64", 0x3e, Cmp::F64(0), |a| if !a.is_finite() { Some(QNAN64) } else { Some((a - a.floor()).min(f64::from_bits(0x3fef_ffff_ffff_ffff)).to_bits()) });
-    d1(s, "v_rcp_f64", 0x2f, Cmp::F64(1 << 29), |a| if den64(a.to_bits()) { None } else { let r = 1.0 / a; if den64(r.to_bits()) { None } else { Some(f64q(r)) } });
-    d1(s, "v_rsq_f64", 0x31, Cmp::F64(1 << 29), |a| if den64(a.to_bits()) { None } else if a == 0.0 { Some(if a.is_sign_negative() { 0xfff0_0000_0000_0000 } else { 0x7ff0_0000_0000_0000 }) } else { Some(f64q(1.0 / a.sqrt())) });
-    d1(s, "v_sqrt_f64", 0x34, Cmp::F64(1 << 29), |a| if den64(a.to_bits()) { None } else { Some(f64q(a.sqrt())) });
+    d1x(s, "v_rcp_f64", 0x2f, 0);
+    d1x(s, "v_rsq_f64", 0x31, 1);
+    d1x(s, "v_sqrt_f64", 0x34, 2);
     d1(s, "v_frexp_mant_f64", 0x3d, Cmp::F64(0), |a| Some(frexp64(a.to_bits()).0));
     s.add("v_frexp_exp_i32_f64", "VOP1", "e32", Class::F64, &[], &[vop1(0x3c, OUT, v(10))], &[], &[Cmp::X], |x| o(frexp64(d(x.d[0], x.d[1]).to_bits()).1));
     s.add("v_cvt_i32_f64", "VOP1", "e32", Class::F64, &[], &[vop1(0x03, OUT, v(10))], &[], &[Cmp::X], |x| o(cvt_i32(d(x.d[0], x.d[1]))));
@@ -991,6 +958,7 @@ fn vop3_ops(s: &mut Suite) {
         if ok { vec![Some(x.d[0]), Some(x.d[1]), Some(0)] } else { vec![None, None, None] }
     });
     vop3p_ops(s);
+    vop3p_int_ops(s);
 }
 
 fn pk_h(a: u32, sel_hi: bool, neg: bool) -> u32 {
@@ -1052,6 +1020,55 @@ fn vop3p_ops(s: &mut Suite) {
             });
         }
     }
+}
+
+fn vop3p_int_ops(s: &mut Suite) {
+    type P = fn(i64, i64, i64) -> i64;
+    let ops: &[(&'static str, u32, u32, bool, bool, P)] = &[
+        ("v_pk_mad_i16", 0x00, 3, true, false, |a, b, c| a * b + c),
+        ("v_pk_mul_lo_u16", 0x01, 2, false, false, |a, b, _| a * b),
+        ("v_pk_add_i16", 0x02, 2, true, true, |a, b, _| a + b),
+        ("v_pk_sub_i16", 0x03, 2, true, true, |a, b, _| a - b),
+        ("v_pk_lshlrev_b16", 0x04, 2, false, false, |a, b, _| b << (a & 15)),
+        ("v_pk_lshrrev_b16", 0x05, 2, false, false, |a, b, _| b >> (a & 15)),
+        ("v_pk_ashrrev_i16", 0x06, 2, true, false, |a, b, _| b >> (a & 15)),
+        ("v_pk_max_i16", 0x07, 2, true, true, |a, b, _| a.max(b)),
+        ("v_pk_min_i16", 0x08, 2, true, true, |a, b, _| a.min(b)),
+        ("v_pk_mad_u16", 0x09, 3, false, false, |a, b, c| a * b + c),
+        ("v_pk_add_u16", 0x0a, 2, false, true, |a, b, _| a + b),
+        ("v_pk_sub_u16", 0x0b, 2, false, true, |a, b, _| a - b),
+        ("v_pk_max_u16", 0x0c, 2, false, true, |a, b, _| a.max(b)),
+        ("v_pk_min_u16", 0x0d, 2, false, true, |a, b, _| a.min(b)),
+    ];
+    let mods: [(&str, u32, u32, bool); 4] = [("default", 0, 7, false), ("swap halves", 0b111, 0b000, false), ("mixed halves", 0b010, 0b101, false), ("clamp", 0, 7, true)];
+    for &(m, op, n, signed, clampable, g) in ops {
+        for &(name, opsel, opsel_hi, cl) in &mods {
+            if cl && !clampable {
+                continue;
+            }
+            let srcs = if n == 3 { [v(10), v(11), v(12)] } else { [v(10), v(11), 0] };
+            s.add(m, "VOP3P", name, Class::U32, &[], &vop3p(op, OUT, srcs, opsel, opsel_hi, 0, 0, cl), &[], &[Cmp::X], move |x| {
+                let half = |k: usize, hi: bool| -> i64 {
+                    let sel = if hi { (opsel_hi >> k) & 1 } else { (opsel >> k) & 1 } != 0;
+                    let u = if sel { x.d[k] >> 16 } else { x.d[k] & 0xffff };
+                    if signed { u as u16 as i16 as i64 } else { u as i64 }
+                };
+                let res = |hi: bool| -> u32 {
+                    let r = g(half(0, hi), half(1, hi), half(2, hi));
+                    let r = match (cl, signed) {
+                        (false, _) => r,
+                        (true, true) => r.clamp(-32768, 32767),
+                        (true, false) => r.clamp(0, 0xffff),
+                    };
+                    (r as u32) & 0xffff
+                };
+                o(res(false) | (res(true) << 16))
+            });
+        }
+    }
+    s.add("v_pk_add_u16", "VOP3P", "inline -1, op_sel_hi[1]=0", Class::U32, &[], &vop3p(0x0a, OUT, [v(10), 193, 0], 0, 0b001, 0, 0, false), &[], &[Cmp::X], |x| {
+        o((x.d[0].wrapping_sub(1) & 0xffff) | (((x.d[0] >> 16).wrapping_sub(1) & 0xffff) << 16))
+    });
 }
 
 pub fn add(s: &mut Suite) {

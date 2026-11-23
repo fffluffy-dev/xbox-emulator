@@ -82,7 +82,7 @@ pub fn layout(os_build: u32) -> Option<Layout> {
     }
 }
 
-type Handle = usize;
+pub(crate) type Handle = usize;
 
 #[repr(C)]
 struct DataDesc {
@@ -143,7 +143,7 @@ fn hr_from_win32(e: u32) -> i32 {
     }
 }
 
-fn record(what: &str, detail: &str) {
+pub(crate) fn record(what: &str, detail: &str) {
     compat_common::record(env!("CARGO_CRATE_NAME"), what, detail);
 }
 
@@ -189,6 +189,29 @@ fn load_xbtp() -> Option<XbtpFns> {
 
 pub fn xbtp() -> Option<XbtpFns> {
     *XBTP.get_or_init(load_xbtp)
+}
+
+pub type TrafficFn = unsafe extern "C" fn(*mut u64, *mut u64) -> i32;
+
+static XBTP_TRAFFIC: OnceLock<usize> = OnceLock::new();
+
+pub fn bind_xbtp_traffic(f: TrafficFn) -> bool {
+    *XBTP_TRAFFIC.get_or_init(|| f as usize) == f as usize
+}
+
+pub fn xbtp_traffic() -> Option<TrafficFn> {
+    let f = *XBTP_TRAFFIC.get_or_init(|| unsafe {
+        let n = wide("xbtp.dll");
+        let mut m = GetModuleHandleW(n.as_ptr());
+        if m == 0 {
+            m = LoadLibraryW(n.as_ptr());
+        }
+        if m == 0 {
+            return 0;
+        }
+        GetProcAddress(m, b"XbtpGetTcpNetworkTrafficStatistics ".as_ptr())
+    });
+    (f != 0).then(|| unsafe { core::mem::transmute::<usize, TrafficFn>(f) })
 }
 
 pub struct EnableState {
@@ -248,6 +271,7 @@ pub struct Context {
     pub capture_arg: AtomicUsize,
     pub state: AtomicU32,
     pub pool: Mutex<Option<Box<BlockPool>>>,
+    pub streams: [Mutex<Option<usize>>; 3],
 }
 
 static CONTEXT: OnceLock<Context> = OnceLock::new();
@@ -270,6 +294,7 @@ pub fn context() -> &'static Context {
             capture_arg: AtomicUsize::new(0),
             state: AtomicU32::new(1),
             pool: Mutex::new(None),
+            streams: [const { Mutex::new(None) }; 3],
         }
     })
 }
@@ -284,7 +309,7 @@ pub fn set_capture_interface(p: usize, arg: usize) -> i32 {
     S_OK
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -308,7 +333,7 @@ pub fn affinity_mask(process_mask: usize) -> usize {
     }
 }
 
-unsafe fn pin_thread() -> usize {
+pub(crate) unsafe fn pin_thread() -> usize {
     let (mut p, mut s) = (0usize, 0usize);
     let ok = GetProcessAffinityMask(GetCurrentProcess(), &mut p, &mut s) != 0;
     if !ok {
@@ -485,6 +510,12 @@ pub struct Runtime {
     pub device_state: AtomicI32,
     pub capture_state: AtomicI32,
     pub pix_dir_created: bool,
+    pub instrument_mode: AtomicU32,
+    pub driver_table: AtomicUsize,
+    pub capture_session: AtomicUsize,
+    pub session: AtomicUsize,
+    pub device_5b8: AtomicU32,
+    pub device_5bc: AtomicU32,
 }
 
 unsafe fn park(rt: &Runtime) {
@@ -537,7 +568,7 @@ unsafe extern "system" fn notification_thread(p: *mut c_void) -> u32 {
     0
 }
 
-unsafe fn runtime_new(layout: &Layout, magic: u32, version: u32, flags: u32) -> Option<&'static Runtime> {
+pub(crate) unsafe fn runtime_new(layout: &Layout, magic: u32, version: u32, flags: u32) -> Option<&'static Runtime> {
     let block = tool_alloc(layout.runtime_bytes) as usize;
     if block == 0 {
         return None;
@@ -566,6 +597,12 @@ unsafe fn runtime_new(layout: &Layout, magic: u32, version: u32, flags: u32) -> 
         device_state: AtomicI32::new(0),
         capture_state: AtomicI32::new(0),
         pix_dir_created,
+        instrument_mode: AtomicU32::new(0),
+        driver_table: AtomicUsize::new(0),
+        capture_session: AtomicUsize::new(0),
+        session: AtomicUsize::new(0),
+        device_5b8: AtomicU32::new(0),
+        device_5bc: AtomicU32::new(0),
     }));
     set_capture_interface(rt as *const Runtime as usize + 8, 0);
     let procs: [ThreadProc; 3] = [device_thread, capture_thread, notification_thread];
@@ -579,12 +616,106 @@ unsafe fn runtime_new(layout: &Layout, magic: u32, version: u32, flags: u32) -> 
     Some(rt)
 }
 
+pub const DRIVER_TABLE_BYTES: usize = 0xf8;
+pub const INSTRUMENT_SEMAPHORE_COUNT: i32 = 0xd;
+pub const EXT_BLOCK_BYTES: usize = 0x40;
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateSemaphoreW(sa: *mut c_void, initial: i32, max: i32, name: *const u16) -> Handle;
+    fn ReleaseSemaphore(h: Handle, n: i32, prev: *mut i32) -> i32;
+}
+
+pub struct Instrument {
+    pub semaphore: Handle,
+    pub owner: AtomicU64,
+    pub started: AtomicBool,
+    pub active: AtomicBool,
+    pub level: AtomicI32,
+    pub pending: AtomicBool,
+}
+
+impl Instrument {
+    unsafe fn new() -> Instrument {
+        Instrument {
+            semaphore: CreateSemaphoreW(core::ptr::null_mut(), INSTRUMENT_SEMAPHORE_COUNT, INSTRUMENT_SEMAPHORE_COUNT, core::ptr::null()),
+            owner: AtomicU64::new(u64::MAX),
+            started: AtomicBool::new(false),
+            active: AtomicBool::new(false),
+            level: AtomicI32::new(0),
+            pending: AtomicBool::new(false),
+        }
+    }
+
+    pub unsafe fn acquire(&self) {
+        WaitForSingleObject(self.semaphore, u32::MAX);
+        self.owner.store(GetCurrentThreadId() as u64, Ordering::SeqCst);
+    }
+
+    pub unsafe fn release(&self) {
+        let mut prev = 0i32;
+        ReleaseSemaphore(self.semaphore, 1, &mut prev);
+        self.owner.store(u64::MAX, Ordering::SeqCst);
+    }
+
+    pub fn instrumenting(&self) -> bool {
+        self.active.load(Ordering::SeqCst) && self.level.load(Ordering::SeqCst) >= 0
+    }
+}
+
 pub struct Singleton {
     pub block: usize,
     pub layout: Layout,
-    runtime: Mutex<Option<&'static Runtime>>,
-    constructing: AtomicBool,
+    pub(crate) runtime: Mutex<Option<&'static Runtime>>,
+    pub(crate) constructing: AtomicBool,
     pub capturing: AtomicBool,
+    pub end_pending: AtomicBool,
+    pub magic: AtomicU32,
+    pub arg4: AtomicU32,
+    pub arg5: AtomicU32,
+    pub arg6: AtomicU32,
+    pub driver_table: Mutex<[u8; DRIVER_TABLE_BYTES]>,
+    pub instrument: Instrument,
+    pub extra: AtomicUsize,
+    pub ext_block: Mutex<[u8; EXT_BLOCK_BYTES]>,
+}
+
+impl Singleton {
+    pub(crate) unsafe fn new(block: usize, layout: Layout) -> Singleton {
+        Singleton {
+            block,
+            layout,
+            runtime: Mutex::new(None),
+            constructing: AtomicBool::new(false),
+            capturing: AtomicBool::new(false),
+            end_pending: AtomicBool::new(false),
+            magic: AtomicU32::new(0),
+            arg4: AtomicU32::new(0),
+            arg5: AtomicU32::new(0),
+            arg6: AtomicU32::new(0),
+            driver_table: Mutex::new([0; DRIVER_TABLE_BYTES]),
+            instrument: Instrument::new(),
+            extra: AtomicUsize::new(0),
+            ext_block: Mutex::new([0; EXT_BLOCK_BYTES]),
+        }
+    }
+}
+
+pub(crate) fn init_lock() -> MutexGuard<'static, Option<&'static Singleton>> {
+    lock(&INIT)
+}
+
+pub(crate) unsafe fn create_singleton(g: &mut Option<&'static Singleton>, layout: Layout) -> Result<&'static Singleton, i32> {
+    if let Some(s) = *g {
+        return Ok(s);
+    }
+    let block = tool_alloc(layout.singleton_bytes) as usize;
+    if block == 0 {
+        return Err(E_OUTOFMEMORY);
+    }
+    let s: &'static Singleton = Box::leak(Box::new(Singleton::new(block, layout)));
+    *g = Some(s);
+    Ok(s)
 }
 
 static INIT: Mutex<Option<&'static Singleton>> = Mutex::new(None);
@@ -615,14 +746,11 @@ pub unsafe extern "system" fn from_title(magic: u32, version: u32, flags: u32, t
     context();
     let hr = {
         let mut g = lock(&INIT);
-        if g.is_none() {
-            let block = tool_alloc(layout.singleton_bytes) as usize;
-            if block == 0 {
-                return E_OUTOFMEMORY;
-            }
-            *g = Some(Box::leak(Box::new(Singleton { block, layout, runtime: Mutex::new(None), constructing: AtomicBool::new(false), capturing: AtomicBool::new(false) })));
-        }
-        ensure_runtime(g.unwrap(), magic, version, flags)
+        let s = match create_singleton(&mut g, layout) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        ensure_runtime(s, magic, version, flags)
     };
     if hr < 0 {
         return hr;
@@ -703,7 +831,7 @@ pub unsafe extern "system" fn begin_capture(kind: u32, desc: *const c_void) -> i
         return E_PENDING;
     }
     if kind == 1 {
-        record("begin capture", "timing capture (type 1: 0x32601-0x32c8b, default backend 0x5f1d0 slot 3 0x27500, ETW .pevt writer) is not ported");
+        record("begin capture", "timing capture (type 1, 0x32601-0x32c8b) is not wired: the .pevt backend 0x27500/0x288f0 and the 0x2b898 front (0x24e7c, 0x25320) are not ported; the capture session 0x1a94c (session.rs) and the ETW controller calls (etw.rs) are ported");
         return E_NOTIMPL;
     }
     let h = CAPTURE.handler.load(Ordering::SeqCst) as *const CaptureHandler;
@@ -1047,7 +1175,7 @@ pub fn xmon_limit(gen: u32) -> u32 {
     }
 }
 
-unsafe fn close_xmon(h: Handle) {
+pub(crate) unsafe fn close_xmon(h: Handle) {
     if h.wrapping_sub(1) <= usize::MAX - 3 {
         NtClose(h);
     }
@@ -1103,6 +1231,17 @@ pub unsafe extern "system" fn slot8(a: u32, b: u32, c: u32, d: u32) -> i32 {
 
 static PMC_EVENT_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
+pub(crate) unsafe fn pmc_busy() -> bool {
+    let mut ev = PMC_EVENT_HANDLE.load(Ordering::SeqCst);
+    if ev == 0 {
+        ev = pmc_event();
+        if ev == 0 {
+            return false;
+        }
+    }
+    WaitForSingleObject(ev, 0) == 0
+}
+
 unsafe fn pmc_event() -> Handle {
     let n = wide(PMC_EVENT);
     let mut h = OpenEventW(0x0010_0002, 0, n.as_ptr());
@@ -1113,7 +1252,7 @@ unsafe fn pmc_event() -> Handle {
     h
 }
 
-unsafe fn open_xmon() -> Handle {
+pub(crate) unsafe fn open_xmon() -> Handle {
     let h = CreateFileW(wide(XMONDRV).as_ptr(), 0xC000_0000, 0, core::ptr::null_mut(), 3, 0, 0);
     if h == usize::MAX {
         let e = GetLastError();

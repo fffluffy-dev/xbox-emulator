@@ -517,6 +517,7 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
     let sp = g.get_or_insert_with(Spans::default);
     housekeeping(sp);
     let mut chosen: Option<((u64, usize), u64, bool)> = None;
+    let mut msaa_align = 0u64;
     if dim == 1 && va % PLACEMENT_ALIGN == 0 && title_buffers_enabled() {
         let width = u64::from_le_bytes(desc[0x10..0x18].try_into().unwrap());
         let flags = u32::from_le_bytes(desc[0x30..0x34].try_into().unwrap());
@@ -573,11 +574,12 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
         }
         let (size, align) = info;
         if size != 0 && size != u64::MAX && align != 0 && align <= crate::msaa_place::max_align(samples) && va % align.min(PLACEMENT_ALIGN) == 0 {
-            if samples <= 1 {
+            let tiles = samples > 1 && crate::msaa_place::tiles_usable();
+            if samples <= 1 || tiles {
                 unsafe { migrate_shadow(real, sp, va, size) };
             }
             let private = if dim >= 2 { oversize_span(va, size, xbox_size) } else { None };
-            let key = match (private, sp.find(Kind::Local, va, size, align)) {
+            let key = match (private, sp.find(Kind::Local, va, size, crate::msaa_place::span_align(samples, align))) {
                 (Some((lo, hi)), _) => unsafe { create_local_heap(real, size, samples > 1) }.map(|h| {
                     STATS.heaps.fetch_add(1, Ordering::Relaxed);
                     static N: AtomicUsize = AtomicUsize::new(0);
@@ -586,11 +588,11 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
                     }
                     (sp.insert(Span { lo, hi, kind: Kind::Local, heap: h as usize, retired: false, live: HashSet::new() }), true)
                 }),
-                (None, Some(k)) if samples > 1 && !crate::msaa_place::capable(sp.get(k).heap) => None,
+                (None, Some(k)) if samples > 1 && !tiles && !crate::msaa_place::capable(sp.get(k).heap) => None,
                 (None, Some(k)) => Some((k, false)),
                 (None, None) => {
                     let (lo, hi) = local_span(va, size.max(xbox_size), reservation(va));
-                    let fits = crate::msaa_place::span_fits(samples, va, lo, align);
+                    let fits = tiles || crate::msaa_place::span_fits(samples, va, lo, align);
                     if fits { unsafe { create_local_heap(real, hi - lo, samples > 1) } } else { None }.map(|h| {
                         STATS.heaps.fetch_add(1, Ordering::Relaxed);
                         (sp.insert(Span { lo, hi, kind: Kind::Local, heap: h as usize, retired: false, live: HashSet::new() }), true)
@@ -599,6 +601,7 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
             };
             if let Some((k, fresh)) = key {
                 chosen = Some((k, va - k.0, fresh));
+                msaa_align = align;
             }
         }
     }
@@ -607,8 +610,15 @@ pub unsafe fn create_placed_x(real: *mut c_void, va: u64, pc_desc: &[u8; 0x38], 
         return None;
     };
     let (heap, kind) = { let s = sp.get(key); (s.heap, s.kind) };
+    let tiled = kind == Kind::Local && crate::msaa_place::needs_tiles(samples, offset, msaa_align, crate::msaa_place::capable(heap));
     let hr = if kind == Kind::Shadow {
         unsafe { crate::title_shadow::place_reserved(real, heap, offset, &desc, init_state, ppv) }
+    } else if tiled {
+        let hr = unsafe { crate::title_shadow::place_tiled(real, heap, offset, &desc, init_state, pclear, ppv) };
+        if hr < 0 && hr != 0x8007_000eu32 as i32 {
+            crate::msaa_place::note_tiles_refused(hr);
+        }
+        hr
     } else {
         unsafe {
             vcall!(real, 29, fn(*mut c_void, u64, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32,

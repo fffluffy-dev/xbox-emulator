@@ -26,14 +26,21 @@ pub fn ensure(pkgs: &[(&str, &str)]) -> PathBuf {
         cmd.arg("build").current_dir(env!("CARGO_MANIFEST_DIR"));
         for (k, _) in std::env::vars_os() {
             let key = k.to_string_lossy().to_ascii_uppercase();
-            let injected = (key.starts_with("CARGO_") && key != "CARGO_HOME") || key == "OUT_DIR" || key.starts_with("RUST_TEST") || key.starts_with("TOMBOX_");
+            let dxc = key == "TOMBOX_DXC" || key == "TOMBOX_DXC_DIR";
+            let injected = (key.starts_with("CARGO_") && key != "CARGO_HOME") || key == "OUT_DIR" || key.starts_with("RUST_TEST") || (key.starts_with("TOMBOX_") && !dxc);
             if injected {
                 cmd.env_remove(&k);
             }
         }
         cmd.env("CARGO_TARGET_DIR", target_dir());
-        if dir.file_name().and_then(|n| n.to_str()) == Some("release") {
-            cmd.arg("--release");
+        match dir.file_name().and_then(|n| n.to_str()) {
+            Some("release") => {
+                cmd.arg("--release");
+            }
+            Some("debug") | None => {}
+            Some(p) => {
+                cmd.arg("--profile").arg(p);
+            }
         }
         for p in &todo {
             cmd.arg("-p").arg(p);

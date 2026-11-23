@@ -1655,7 +1655,7 @@ fn is_elevated() -> bool {
     }
 }
 
-static TRACE_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static TRACE_LOCK: Mutex<()> = Mutex::new(());
 static XCRD_OPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static XCRD_DIR: Mutex<Vec<u16>> = Mutex::new(Vec::new());
 static XCRD_FAIL: Mutex<Vec<(&'static str, HRESULT)>> = Mutex::new(Vec::new());
@@ -1925,7 +1925,8 @@ fn advanced_multiplayer_trace_runs_real_etw_or_returns_the_access_error() {
         if elevated {
             assert_eq!(hr, S_OK);
             assert_ne!(trace::WPP.logger.load(Ordering::Acquire), 0);
-            assert_ne!(trace::WPP.flags.load(Ordering::Acquire) & trace::WPP_STATE_FLAG, 0);
+            assert_ne!(trace::WPP_STATE.logger.load(Ordering::Acquire), 0);
+            assert_ne!(trace::WPP_STATE.flags.load(Ordering::Acquire) & trace::WPP_STATE_FLAG, 0);
             assert_eq!(trace::trace_type(), 2);
             assert_eq!(xops(), mount_ops());
             assert!(dir.join("GameCoreTrace").join("xbtitletrace.etl").is_file());
@@ -2036,10 +2037,12 @@ fn wpp_control_guid_registers_and_stays_quiet_until_enabled() {
     unsafe {
         assert_eq!(trace::wpp_init(), 0);
         assert_ne!(trace::WPP.registration.load(Ordering::Acquire), 0);
+        assert_ne!(trace::WPP_STATE.registration.load(Ordering::Acquire), 0);
         assert_eq!(trace::wpp_init(), 0);
         assert!(!trace::wpp_message(&trace::STATE_HEADER_GUID, 0xe, 0));
         trace::wpp_cleanup();
         assert_eq!(trace::WPP.registration.load(Ordering::Acquire), 0);
+        assert_eq!(trace::WPP_STATE.registration.load(Ordering::Acquire), 0);
     }
 }
 

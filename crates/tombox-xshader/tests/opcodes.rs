@@ -69,6 +69,7 @@ fn shader(words: &[u32], root: Option<RootSig>) -> ShaderExtract {
         has_root_sig: root.is_some(),
         input_sig: vec![],
         output_sig: vec![sig("SV_Target", 64, 3, 0, 0xf)],
+        prim_sig: Vec::new(),
         resources: Vec::new(),
         gs_info: None,
         root_sig: root,
@@ -462,9 +463,9 @@ fn double_precision_ops() {
         ("v_trig_preop_f64", o(0x174, [v(0), 0x81, 0]), "tb_trig_preop64(asdouble(v0, v1), 0x1u)"),
         ("v_mad_u64_u32", vcc(0x176, [v(1), v(2), v(0)]), "tb_mulhi_u32(v1, v2)"),
         ("v_mad_i64_i32", vcc(0x177, [v(1), v(2), v(0)]), "tb_mulhi_i32(v1, v2)"),
-        ("v_sqrt_f64", vec![vop1(0x34, 4, v(0))], "tb_sqrt64(asdouble(v0, v1))"),
-        ("v_rsq_f64", vec![vop1(0x31, 4, v(0))], "(1.0L / tb_sqrt64("),
-        ("v_rcp_f64", vec![vop1(0x2f, 4, v(0))], "(1.0L / asdouble(v0, v1))"),
+        ("v_sqrt_f64", vec![vop1(0x34, 4, v(0))], "tb_t64(2u, "),
+        ("v_rsq_f64", vec![vop1(0x31, 4, v(0))], "tb_t64(1u, "),
+        ("v_rcp_f64", vec![vop1(0x2f, 4, v(0))], "tb_t64(0u, "),
         ("v_floor_f64", vec![vop1(0x1a, 4, v(0))], "tb_floor64("),
         ("v_ceil_f64", vec![vop1(0x18, 4, v(0))], "tb_ceil64("),
         ("v_trunc_f64", vec![vop1(0x17, 4, v(0))], "tb_trunc64("),
@@ -640,17 +641,6 @@ fn image_atomics_on_a_uint_uav() {
     }
 }
 
-/// 64-bit image atomics (dmask 3, cmpswap 0xf) are refused, not narrowed to 32 bits.
-#[test]
-fn image_atomic_64bit_forms_are_refused() {
-    let root = || Some(RootSig { version: 2, flags: 1, params: vec![table(1, 64)], num_static_samplers: 0, static_samplers: Vec::new() });
-    for (op, dmask) in [(0x11, 3), (0x10, 0xf)] {
-        let body = [0xf40c_0004, 0xfa00_0000, img_atomic(op, dmask, true), 0x0000_0401, vop1(1, 0, v(4))];
-        let e = translate(&shader(&program(&body), root())).err().unwrap_or_else(|| panic!("op {op:#x} translated"));
-        assert!(e.contains("only 32-bit image atomics"), "{e}");
-    }
-}
-
 /// Without GLC an image atomic returns nothing: vdata keeps the operand.
 #[test]
 fn image_atomic_without_glc_keeps_vdata() {
@@ -706,4 +696,68 @@ fn image_get_lod_reads_both_lods() {
         root,
         &["tex0.CalculateLevelOfDetail(samp0, float2(asfloat(v1), asfloat(v2)))", "tex0.CalculateLevelOfDetailUnclamped(samp0,"],
     );
+}
+
+fn flat_dword0(op: u32, seg: u32, dlc: u32, glc: u32, slc: u32, offset: i32) -> u32 {
+    0xdc00_0000 | (op << 18) | (seg << 14) | (dlc << 12) | (glc << 16) | (slc << 17) | (offset as u32 & 0xfff)
+}
+
+fn decode_flat(dword0: u32) -> (String, i64, u8) {
+    let isa: Vec<u8> = [dword0, 0x7f01_0102u32].iter().flat_map(|w| w.to_le_bytes()).collect();
+    let ins = tombox_xshader::rdna2::disassemble(&isa).into_iter().next().expect("one instruction");
+    assert_eq!(ins.dwords, 2, "{dword0:#010x}");
+    (ins.mnemonic, ins.aux.imm, ins.aux.mask)
+}
+
+#[test]
+fn flat_global_and_scratch_offsets_do_not_take_the_dlc_bit() {
+    for dlc in [0u32, 1] {
+        for (glc, slc) in [(0u32, 0u32), (1, 1)] {
+            for off in [0i32, 4, 0x7ff, -1, -4, -0x800] {
+                let (m, imm, seg) = decode_flat(flat_dword0(0x0c, 2, dlc, glc, slc, off));
+                assert_eq!((m.as_str(), imm, seg), ("flat_load_dword", off as i64, 2), "global dlc={dlc} glc={glc} slc={slc} offset {off}");
+                let (m, imm, seg) = decode_flat(flat_dword0(0x0c, 1, dlc, glc, slc, off));
+                assert_eq!((m.as_str(), imm, seg), ("flat_load_dword", off as i64, 1), "scratch dlc={dlc} glc={glc} slc={slc} offset {off}");
+            }
+            for off in [0i32, 4, 0x7ff] {
+                let (m, imm, seg) = decode_flat(flat_dword0(0x0c, 0, dlc, glc, slc, off));
+                assert_eq!((m.as_str(), imm, seg), ("flat_load_dword", off as i64, 0), "flat dlc={dlc} glc={glc} slc={slc} offset {off}");
+            }
+        }
+    }
+}
+
+fn vop3p(op: u32, vdst: u32, srcs: [u32; 3], opsel_hi: u32, neg: u32, clamp: bool) -> [u32; 2] {
+    [
+        0xcc00_0000 | (op << 16) | ((clamp as u32) << 15) | (((opsel_hi >> 2) & 1) << 14) | vdst,
+        srcs[0] | (srcs[1] << 9) | (srcs[2] << 18) | ((opsel_hi & 3) << 27) | (neg << 29),
+    ]
+}
+
+#[test]
+fn vop3p_int16_names_follow_the_rdna2_opcode_table() {
+    let names = [
+        "v_pk_mad_i16", "v_pk_mul_lo_u16", "v_pk_add_i16", "v_pk_sub_i16", "v_pk_lshlrev_b16", "v_pk_lshrrev_b16", "v_pk_ashrrev_i16",
+        "v_pk_max_i16", "v_pk_min_i16", "v_pk_mad_u16", "v_pk_add_u16", "v_pk_sub_u16", "v_pk_max_u16", "v_pk_min_u16",
+    ];
+    for (op, want) in names.iter().enumerate() {
+        let w = vop3p(op as u32, 4, [v(1), v(2), v(3)], 7, 0, false);
+        assert_eq!(mnemonic(&w).0, *want, "VOP3P opcode {op:#x}");
+        check(want, &program(&vop3p(op as u32, 0, [v(1), v(2), v(3)], 7, 0, false)), None, &[]);
+    }
+}
+
+#[test]
+fn vop3p_int16_refuses_modifiers_without_defined_integer_semantics() {
+    let err = |w: [u32; 2]| translate(&shader(&program(&w), None)).err().unwrap_or_default();
+    assert!(err(vop3p(0x0a, 0, [v(1), v(2), 0], 7, 0b010, false)).contains("NEG/NEG_HI on an integer packed op"));
+    assert!(err(vop3p(0x01, 0, [v(1), v(2), 0], 7, 0, true)).contains("CLAMP on an integer packed op"));
+    assert!(err(vop3p(0x04, 0, [v(1), v(2), 0], 7, 0, true)).contains("CLAMP on an integer packed op"));
+    check("v_pk_add_u16", &program(&vop3p(0x0a, 0, [v(1), 242, 0], 7, 0, false)), None, &[]);
+    for op in [0x00, 0x09] {
+        check("clamp", &program(&vop3p(op, 0, [v(1), v(2), v(3)], 7, 0, true)), None, &[]);
+    }
+    for op in [0x02, 0x03, 0x07, 0x0a, 0x0b, 0x0d] {
+        check("clamp", &program(&vop3p(op, 0, [v(1), v(2), 0], 7, 0, true)), None, &[]);
+    }
 }

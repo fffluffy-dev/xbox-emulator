@@ -13,13 +13,21 @@
 
 mod device_wrap;
 mod res3d;
+mod res_pool;
+mod title_gpu;
+#[cfg(test)]
+mod title_gpu_tests;
 mod dxgi_device;
 mod xone_dxgi;
 mod xone_queue;
 mod ecl_probe;
 mod cbv_raw;
+mod cbv_copy;
 mod hang_cap;
+mod hang_snap;
+mod rootlog;
 mod bl_alias;
+mod cpu_watch;
 mod vs_snorm;
 mod pso_async;
 mod xone_heap;
@@ -30,7 +38,13 @@ mod xone_tex;
 mod heap_wrap;
 mod cmdlist_wrap;
 mod blendclamp;
+mod blend_probe;
 mod gpuprof;
+mod gpuprof_q;
+mod gpuprof_tl;
+mod va_census;
+mod firstuse;
+mod inject;
 mod slowcall;
 mod console_slots;
 mod console_slots_cl2;
@@ -43,8 +57,12 @@ mod overlay;
 mod frame_csv;
 mod frame_ev;
 mod xlat_index;
+mod pso_lib;
+mod pso_prewarm;
+mod pso_xrec;
 mod overlay_font;
 mod overlay_sensors;
+mod vram_log;
 #[cfg(test)]
 mod overlay_hw;
 mod present_snap;
@@ -60,6 +78,10 @@ mod guard;
 mod upload;
 mod reaper;
 mod rtcap;
+mod passcap;
+mod fmask_check;
+#[cfg(test)]
+mod passcap_tests;
 mod bindtrace;
 mod replay;
 mod map_x;
@@ -87,6 +109,7 @@ mod gpu_hw_config;
 mod kmd_slots;
 mod placed_offset;
 mod msaa_place;
+mod rectlist;
 mod gpu_wait;
 mod cl_ext;
 mod dbcount;
@@ -101,6 +124,8 @@ mod bop64;
 mod wait_probe;
 #[cfg(test)]
 mod hw_tests;
+#[cfg(test)]
+mod blendclamp_hw;
 mod driver_state;
 #[cfg(test)]
 mod driver_unload_tests;
@@ -202,6 +227,11 @@ fn host_d3d12() -> HMODULE {
 }
 
 fn host_proc(name: &[u8]) -> usize {
+    #[cfg(test)]
+    if name.starts_with(b"D3D12CreateDevice\0") {
+        static EXPERIMENTAL_FIRST: std::sync::Once = std::sync::Once::new();
+        EXPERIMENTAL_FIRST.call_once(enable_experimental_shader_models);
+    }
     let h = host_d3d12();
     if h.is_null() { return 0; }
     unsafe { GetProcAddress(h, name.as_ptr()) as usize }

@@ -83,6 +83,7 @@ name = "compat-common"
 version = "0.1.0"
 dependencies = [
  "iced-x86",
+ "miniz_oxide",
  "serde_json",
 ]
 
@@ -398,6 +399,8 @@ version = "0.1.0"
 name = "netprofmsvc_c"
 version = "0.1.0"
 dependencies = [
+ "compat-common",
+ "console-sandbox",
  "xone-exports",
 ]
 
@@ -858,6 +861,7 @@ dependencies = [
 name = "xbtp"
 version = "0.1.0"
 dependencies = [
+ "compat-common",
  "xone-exports",
 ]
 
@@ -1075,6 +1079,7 @@ dependencies = [
 name = "xtfdiaginfo"
 version = "0.1.0"
 dependencies = [
+ "compat-common",
  "xbtp",
  "xtfbaseservices",
  "xtfcommon",

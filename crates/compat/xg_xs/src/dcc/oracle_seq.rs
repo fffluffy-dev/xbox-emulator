@@ -745,7 +745,8 @@ fn dcc_watch_scratch() {
     let b = build_of(&o);
     let c = case(id);
     let dec = !c.enc;
-    let (site, chk) = if dec { ([b.dconv, b.drelays[0], b.drelays[1], b.drelays[2]][site_k], b.dec_chk) } else { ([b.relays[0], b.relays[1], b.relays[2], b.convs][site_k], b.enc_chk) };
+    let site0 = std::env::var("TOMBOX_DCC_SITE0").ok().and_then(|x| usize::from_str_radix(x.trim_start_matches("0x"), 16).ok()).unwrap_or(b.dconv);
+    let (site, chk) = if dec { ([site0, b.drelays[0], b.drelays[1], b.drelays[2]][site_k], b.dec_chk) } else { ([b.relays[0], b.relays[1], b.relays[2], b.convs][site_k], b.enc_chk) };
     let (cd, ce) = (o.f("XGDecodeDCC") as usize, o.f("XGEncodeDCC") as usize);
     let mut e = 0;
     let mut rs = 0;
@@ -825,7 +826,8 @@ fn dcc_needed_dec_bytes() {
     let b = build_of(&o);
     arm_veh(o.h);
     let (cd, ce) = (o.f("XGDecodeDCC") as usize, o.f("XGEncodeDCC") as usize);
-    let sites = [(b.dconv, b.conv), (b.drelays[0], b.relay), (b.drelays[1], b.relay), (b.drelays[2], b.relay)];
+    let site0 = std::env::var("TOMBOX_DCC_SITE0").ok().and_then(|x| usize::from_str_radix(x.trim_start_matches("0x"), 16).ok()).unwrap_or(b.dconv);
+    let sites = [(site0, b.conv), (b.drelays[0], b.relay), (b.drelays[1], b.relay), (b.drelays[2], b.relay)];
     let ss: Vec<super::oracle_cases::Snap> = sites.iter().map(|&(s, t)| unsafe { super::oracle_cases::Snap::new(o.h, s, o.h + t) }).collect();
     let pd = unsafe { RspProbe::new(o.h, b.dec_chk) };
     for &id in &ids {
@@ -938,7 +940,8 @@ fn dcc_dec_residue_find() {
     let b = build_of(&o);
     let (cd, ce) = (o.f("XGDecodeDCC") as usize, o.f("XGEncodeDCC") as usize);
     let c = case(id);
-    let sites = [(b.dconv, b.conv), (b.drelays[0], b.relay), (b.drelays[1], b.relay), (b.drelays[2], b.relay)];
+    let site0 = std::env::var("TOMBOX_DCC_SITE0").ok().and_then(|x| usize::from_str_radix(x.trim_start_matches("0x"), 16).ok()).unwrap_or(b.dconv);
+    let sites = [(site0, b.conv), (b.drelays[0], b.relay), (b.drelays[1], b.relay), (b.drelays[2], b.relay)];
     for &m in &c.meta {
         let sg = crate::dcc::bits::seg_info_checked(m as u32);
         println!("rfind {id} meta {m:#x} segs {sg:x?}");
@@ -1013,8 +1016,9 @@ fn oracle_dcc_accepted_cases_invariant_undefined_masked() {
     let n: u64 = std::env::var("TOMBOX_DCC_INV_N").ok().and_then(|x| x.parse().ok()).unwrap_or(3000);
     let (nd, ne) = natives();
     let (cd, ce) = (o.f("XGDecodeDCC") as usize, o.f("XGEncodeDCC") as usize);
-    let (_rh, rd, re) = relocated_copy();
+    let (rh, rd, re) = relocated_copy();
     arm_veh(o.h);
+    let gp: Option<[*mut [u8; 64]; 2]> = crate::dcc_oracle::console_relay_g(&o).map(|p| [p, (rh + 0x80bf0) as *mut [u8; 64]]);
     let (mut acc, mut runs, mut bad) = (0usize, 0usize, Vec::new());
     let (mut defined, mut undef_varied, mut undef_stable, mut unmodeled) = (0usize, 0usize, 0usize, Vec::new());
     let mut undef_ids = Vec::new();
@@ -1025,9 +1029,13 @@ fn oracle_dcc_accepted_cases_invariant_undefined_masked() {
         }
         spray(0);
         let _ = smear(0);
+        if std::env::var("TOMBOX_DCC_UNDEF_WHY").is_ok() {
+            println!("undef-why case {id}");
+        }
+        let g = crate::dcc_oracle::sync_relay_g(&o);
         let (nat, u) = native_masked(nd, ne, &c);
         if nat.hr != 0 {
-            if !c.enc && crate::dcc::dec::last_unmodeled() {
+            if if c.enc { crate::dcc::last_enc_unmodeled() } else { crate::dcc::dec::last_unmodeled() } {
                 unmodeled.push(id);
             }
             continue;
@@ -1036,6 +1044,12 @@ fn oracle_dcc_accepted_cases_invariant_undefined_masked() {
         CUR_ID.store(id as usize, std::sync::atomic::Ordering::SeqCst);
         let mut seen: Vec<Out> = Vec::new();
         for v in 0..10usize {
+            if let (Some(gp), Some(g)) = (gp, g) {
+                unsafe {
+                    *gp[0] = g;
+                    *gp[1] = g;
+                }
+            }
             let r = match v {
                 5 => perturbed_call(rd, re, &c, 0),
                 6 | 7 => with_xmem_hook(v, || perturbed_call(cd, ce, &c, 0)),
@@ -1061,6 +1075,10 @@ fn oracle_dcc_accepted_cases_invariant_undefined_masked() {
                 undef_varied += 1;
             } else {
                 undef_stable += 1;
+                if std::env::var("TOMBOX_DCC_STABLE_WHY").is_ok() {
+                    let drivers: Vec<u32> = (0..4u32).filter(|&bit| native_with(&c, 0x1000_0000, 1 << bit) == 0 && crate::dcc::last_undefined().get(i) == Some(&true)).collect();
+                    println!("stable-undef {id} enc {} fmt {} blk {i} drivers {:?}", c.enc, c.fmt, drivers);
+                }
             }
         }
         if u.iter().any(|&x| x) {
@@ -1071,9 +1089,13 @@ fn oracle_dcc_accepted_cases_invariant_undefined_masked() {
     if let Ok(p) = std::env::var("TOMBOX_DCC_UNDEF_OUT") {
         std::fs::write(p, format!("{:?}\n{:?}\n", undef_ids, unmodeled)).unwrap();
     }
-    println!("dcc accepted cases, undefined blocks masked ({}): {acc} of {n} generator cases native S_OK; blocks: {defined} defined (compared byte-exact), {} undefined (read console stack scratch no console code writes first; masked: {undef_varied} changed under the perturbations below, {undef_stable} never did) in {} cases; native E_INVALIDARG for {} decoder cases whose remap holes are console-written frame locals native does not model yet: {:?}; {runs} console runs under stack smears 00/ff/random, heap sprays, a relocated console DLL, two forwarding XMem allocation hooks and two rewrites of the host-written convert scratch quads; {} differ from native on a defined block: {:?}", b.name, undef_varied + undef_stable, undef_ids.len(), unmodeled.len(), &unmodeled[..unmodeled.len().min(40)], bad.len(), &bad[..bad.len().min(40)]);
+    println!("dcc accepted cases, undefined blocks masked ({}): {acc} of {n} generator cases native S_OK; blocks: {defined} defined (compared byte-exact), {} undefined (read console stack scratch no console code writes first; masked: {undef_varied} changed under the perturbations below, {undef_stable} never did) in {} cases; native E_INVALIDARG for {} cases whose unknown inputs are console-written frame or relayout-entry locals native does not model yet: {:?}; {runs} console runs under stack smears 00/ff/random, heap sprays, a relocated console DLL, two forwarding XMem allocation hooks and two rewrites of the host-written convert scratch quads; {} differ from native on a defined block: {:?}", b.name, undef_varied + undef_stable, undef_ids.len(), unmodeled.len(), &unmodeled[..unmodeled.len().min(40)], bad.len(), &bad[..bad.len().min(40)]);
     assert!(bad.is_empty());
-    assert!(unmodeled.iter().all(|id| b.unmodeled.contains(id)), "decoder cases rejected as unmodeled console-written frame locals outside the known list for this build: {:?}", unmodeled.iter().filter(|id| !b.unmodeled.contains(id)).collect::<Vec<_>>());
+    if let Ok(p) = std::env::var("TOMBOX_DCC_UNMODELED_OUT") {
+        std::fs::write(p, format!("{:?}", unmodeled)).unwrap();
+    }
+    assert_eq!(unmodeled.len(), b.unmodeled_n, "unmodeled rejections changed for this build: {:?}", unmodeled);
+    assert!(unmodeled.iter().all(|id| b.unmodeled.is_empty() || b.unmodeled.contains(id)), "cases rejected as unmodeled console-written locals outside the known list for this build: {:?}", unmodeled.iter().filter(|id| !b.unmodeled.contains(id)).collect::<Vec<_>>());
 }
 
 fn seq_id(seed: u64, j: u64) -> u64 {

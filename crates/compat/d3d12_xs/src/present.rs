@@ -628,6 +628,7 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
     vcall!(st.alloc, 8, fn() -> i32); // allocator Reset
     vcall!(st.list, 10, fn(*mut c_void, *mut c_void) -> i32, st.alloc, core::ptr::null_mut());
     crate::frame_csv::list_begin(st.device, st.list, st.frames + 1, ts_freq(queue));
+    crate::gpuprof::own_begin(st.list, crate::gpuprof::TAG_PRESENT);
     let pre = [barrier(src, COMMON, COPY_SOURCE), barrier(dst, COMMON, COPY_DEST)];
     vcall!(st.list, 26, fn(u32, *const [u64; 4]) -> (), 2, pre.as_ptr());
     vcall!(st.list, 17, fn(*mut c_void, *mut c_void) -> (), dst, src); // CopyResource
@@ -653,6 +654,7 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
     let post = [barrier(src, COPY_SOURCE, COMMON), barrier(dst, dst_after, COMMON)];
     vcall!(st.list, 26, fn(u32, *const [u64; 4]) -> (), 2, post.as_ptr());
     crate::frame_csv::list_end(st.list, st.frames + 1);
+    crate::gpuprof::own_close(st.list);
     let hr = vcall!(st.list, 9, fn() -> i32);
     if let Some((rb_src, rb_dst)) = snaps {
         if hr >= 0 {
@@ -727,6 +729,16 @@ unsafe fn ts_freq(queue: *mut c_void) -> u64 {
 unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes: *const u8, _params: *const u8) -> i32 {
     static CALLS: AtomicUsize = AtomicUsize::new(0);
     let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    let entry = crate::frame::qpc();
+    let mut presented = false;
+    let r = present_x_body(queue, plane_count, planes, n, entry, &mut presented);
+    if !presented && crate::frame_csv::on() {
+        crate::frame_csv::present_skipped(entry);
+    }
+    r
+}
+
+unsafe fn present_x_body(queue: *mut c_void, plane_count: u32, planes: *const u8, n: usize, entry: i64, shown: &mut bool) -> i32 {
     if plane_count != 0 && !planes.is_null() {
         // The frame identified by this token counts as flipped from here on (the title's
         // flip tracking keys off it), even if the host-side present below fails.
@@ -745,12 +757,13 @@ unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes
         return 0;
     }
     let src = *pp;
-    let entry = crate::frame::qpc();
     crate::perf::on_present();
     crate::qwait::poll();
     crate::gpuprof::on_present();
+    crate::firstuse::on_present();
     crate::hot_reload::on_present();
     crate::present_probe::on_present(src, plane_count, planes);
+    crate::passcap::on_present(queue, src, plane_count, planes);
     crate::upload::register_direct_queue(queue);
     crate::slowcall::time("PresentX upload pump", || crate::frame_ev::time(crate::frame_ev::UPLOAD, || crate::perf::timed(crate::perf::UPLOAD, || crate::upload::pump(queue))));
     crate::slowcall::time("PresentX replay/rtcap", || crate::perf::timed(crate::perf::RTCAP, || {
@@ -784,6 +797,8 @@ unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes
             if crate::frame_csv::on() {
                 crate::frame_csv::present_done(st.frames, entry);
             }
+            *shown = true;
+            crate::pso_lib::on_present();
         }
         Err(e) => {
             if n < 8 {
@@ -928,6 +943,8 @@ qlow!((l8,8),(l9,9),(l10,10),(l11,11),(l12,12),(l13,13),(l14,14),(l15,15),(l16,1
 /// Title-side ExecuteCommandLists (PC slot 10): the title passes command-list *shims*
 /// (see cmdlist_wrap); translate them to the real lists before submitting.
 unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const *mut c_void) {
+    let _ours = crate::gpuprof_q::ours_scope();
+    let enter = if crate::gpuprof::enabled() { crate::frame::qpc() } else { 0 };
     let f: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) =
         core::mem::transmute(REAL_QVT[10].load(Ordering::Relaxed));
     if lists.is_null() || n == 0 {
@@ -938,12 +955,16 @@ unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const
     let before = crate::ecl_probe::removed_reason(queue);
     let real: Vec<*mut c_void> =
         (0..n as usize).map(|i| crate::cmdlist_wrap::unwrap(*lists.add(i))).collect();
+    if crate::passcap::on() {
+        crate::passcap::note_submit(queue as usize, &crate::list_split::expand(&real));
+    }
     let mut real = crate::cl2_state::skip_presubmitted(crate::list_split::expand(&real));
     crate::indirect_bundle::resolve(&mut real);
     let real = crate::ecl_probe::refuse_failed(real);
     if real.is_empty() {
         return;
     }
+    crate::upload::submit_hook(queue);
     crate::sys_ts::note_queue(queue, REAL_QVT[16].load(Ordering::Relaxed), REAL_QVT[17].load(Ordering::Relaxed));
     crate::rtcap::note_submit(queue as usize, &title, &real);
     let split = crate::cl2_state::before_execute(queue, &real);
@@ -951,13 +972,18 @@ unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const
     crate::title_shadow::before_execute();
     crate::slowcall::time("queue ExecuteCommandLists replay hook", || crate::replay::on_execute(queue, &real));
     crate::hang_cap::note_exec(queue, &title, &real);
+    crate::placed_offset::before_submit(queue, &real, f as usize, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)));
+    crate::gpuprof::ecl_begin(queue, f, &real, enter);
     crate::slowcall::time("queue ExecuteCommandLists", || crate::gpu_wait::submit(queue, &real, f, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)), crate::hang_cap::wait_fn(REAL_QVT[15].load(Ordering::Relaxed))));
+    crate::gpuprof::ecl_end(queue, f);
+    crate::placed_offset::after_submit(queue, &real, f as usize, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)));
     crate::ecl_probe::check("ExecuteCommandLists", queue, REAL_QVT[18].load(Ordering::Relaxed), &title, &real, before);
     crate::title_shadow::after_execute(queue, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)), crate::hang_cap::wait_fn(REAL_QVT[15].load(Ordering::Relaxed)));
     crate::list_split::after_submit(queue, &real);
     crate::cl2_state::note_executed(queue, &real);
     crate::cl2_state::after_execute(queue, &split);
     crate::ts99::after_execute(queue, &real);
+    crate::gpuprof::ecl_exit(queue);
 }
 
 unsafe extern "system" fn queue_freq(queue: *mut c_void, out: *mut u64) -> i32 {
@@ -1037,6 +1063,7 @@ pub fn apply_queue_vtable(queue: *mut c_void) {
                 // which would have read the same memory through the original vtable anyway.
                 REAL_QVT[i].store(*real_vt.add(i), Ordering::Relaxed);
             }
+            crate::gpuprof_q::install(&REAL_QVT);
             for i in 0..PC_QUEUE_SLOTS {
                 QUEUE_VT[i].store(*real_vt.add(i), Ordering::Relaxed);
             }
