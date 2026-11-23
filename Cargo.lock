@@ -636,6 +636,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tombox-launch"
+version = "0.1.0"
+dependencies = [
+ "tombox-pe",
+]
+
+[[package]]
 name = "tombox-pe"
 version = "0.1.0"
 
@@ -932,6 +939,13 @@ name = "xg_xs"
 version = "0.1.0"
 dependencies = [
  "compat-common",
+]
+
+[[package]]
+name = "xgameruntime"
+version = "0.1.0"
+dependencies = [
+ "xone-exports",
 ]
 
 [[package]]

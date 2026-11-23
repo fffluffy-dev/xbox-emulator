@@ -1,0 +1,8 @@
+1 InitializeApiImpl implemented | S_OK: there is no runtime service to connect to; the compat-common GDK runtime is in-process
+2 InitializeApiImplEx implemented | S_OK, as InitializeApiImpl
+3 QueryApiImpl implemented | E_INVALIDARG for null arguments, else *out = NULL and E_NOINTERFACE; compat-common hooks GetProcAddress(xgameruntime, QueryApiImpl) and answers the interfaces it emulates before falling back here
+4 UninitializeApiImpl implemented | no-op
+5 XErrorReport implemented | no-op; compat-common logs XErrorReport itself where it hooks the title
+6 InitializeApiImplEx2 implemented | S_OK, as InitializeApiImpl; GTA VI 1.0.2.1 imports it (upstream omonkeyz/xbox-emulator#293)
+7 XGameRuntimeInitialize implemented | S_OK, as InitializeApiImpl
+8 XGameRuntimeUninitialize implemented | no-op

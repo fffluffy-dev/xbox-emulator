@@ -23,6 +23,7 @@ members = [
     "crates/compat/opus",
     "crates/compat/mfplat",
     "crates/compat/mflnmhelp",
+    "crates/compat/xgameruntime",
     "crates/compat/xfp_gc",
     "crates/compat/mfh264dec",
     "crates/compat/mfhevcdec",
@@ -117,6 +118,7 @@ members = [
     "crates/tools/xreplay",
     "crates/tools/audio-replay",
     "crates/tools/compat_smoke",
+    "crates/tools/tombox-launch",
     "crates/tests/audio_titles",
 ]
 
