@@ -8,6 +8,8 @@ use crate::device_wrap::Guid;
 
 pub const IID_XBOX_GRAPHICS_COMMAND_LIST5: Guid =
     Guid { d1: 0x5505_0859, d2: 0x4024, d3: 0x474c, d4: [0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74] };
+pub const IID_XBOX_GRAPHICS_COMMAND_LIST: Guid =
+    Guid { d1: 0xc382_7890, d2: 0x4024, d3: 0x474c, d4: [0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74] };
 const IID_PC_GRAPHICS_COMMAND_LIST5: Guid =
     Guid { d1: 0x5505_0859, d2: 0x4024, d3: 0x474c, d4: [0x87, 0xf5, 0x64, 0x72, 0xea, 0xee, 0x44, 0xea] };
 const IID_DEVICE: Guid =
@@ -179,6 +181,14 @@ unsafe fn vrs_tier(list: *mut c_void) -> i32 {
     tier
 }
 
+pub fn pc_list_iid(riid: &Guid) -> Option<Guid> {
+    if *riid == IID_XBOX_GRAPHICS_COMMAND_LIST || *riid == crate::dma_list::IID_XBOX_DMA_COMMAND_LIST {
+        Some(PC_GRAPHICS_LIST_IIDS[0])
+    } else {
+        None
+    }
+}
+
 pub fn xbox_list5_answer(is_list5_iid: bool, tier: i32, pc_qi_ok: bool) -> bool {
     is_list5_iid && tier >= 1 && pc_qi_ok
 }
@@ -189,8 +199,10 @@ unsafe extern "system" fn query_interface_x(this: *mut c_void, riid: *const Guid
     if riid.is_null() || ppv.is_null() {
         return qi(this, riid, ppv);
     }
-    if PC_GRAPHICS_LIST_IIDS.iter().any(|g| *g == *riid) {
-        let hr = qi(this, riid, ppv);
+    let base = *riid == IID_XBOX_GRAPHICS_COMMAND_LIST;
+    if base || PC_GRAPHICS_LIST_IIDS.iter().any(|g| *g == *riid) {
+        let pc = if base { &PC_GRAPHICS_LIST_IIDS[0] as *const Guid } else { riid };
+        let hr = qi(this, pc, ppv);
         if hr >= 0 && !(*ppv).is_null() {
             if let Some(shim) = shim_of(this) {
                 *ppv = shim as *mut c_void;
@@ -277,6 +289,17 @@ mod tests {
         for (i, a) in PC_GRAPHICS_LIST_IIDS.iter().enumerate() {
             for b in &PC_GRAPHICS_LIST_IIDS[i + 1..] { assert!(*a != *b); }
         }
+    }
+
+    #[test]
+    fn xbox_base_list_iid_creates_the_pc_base_list() {
+        assert_eq!(IID_XBOX_GRAPHICS_COMMAND_LIST.d2, IID_XBOX_GRAPHICS_COMMAND_LIST5.d2);
+        assert_eq!(IID_XBOX_GRAPHICS_COMMAND_LIST.d4, IID_XBOX_GRAPHICS_COMMAND_LIST5.d4);
+        assert!(IID_XBOX_GRAPHICS_COMMAND_LIST != IID_XBOX_GRAPHICS_COMMAND_LIST5);
+        assert_eq!(pc_list_iid(&IID_XBOX_GRAPHICS_COMMAND_LIST), Some(crate::dma_list::IID_GRAPHICS_COMMAND_LIST));
+        assert_eq!(pc_list_iid(&crate::dma_list::IID_XBOX_DMA_COMMAND_LIST), Some(crate::dma_list::IID_GRAPHICS_COMMAND_LIST));
+        assert_eq!(pc_list_iid(&IID_XBOX_GRAPHICS_COMMAND_LIST5), None);
+        for g in &PC_GRAPHICS_LIST_IIDS { assert_eq!(pc_list_iid(g), None); }
     }
 
     #[test]
