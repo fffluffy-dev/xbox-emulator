@@ -17,7 +17,7 @@ const E_POINTER: i32 = 0x8000_4003u32 as i32;
 const E_NOINTERFACE: i32 = 0x8000_4002u32 as i32;
 
 #[repr(C)]
-#[derive(PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Guid {
     pub d1: u32,
     pub d2: u16,
@@ -242,7 +242,6 @@ unsafe extern "system" fn create_command_allocator_x(this: *mut DeviceWrapper, t
 /// Xbox slot 73 = command-list create. Xbox signature (read from the call site):
 ///   HRESULT (this, const Params* [rdx], ID3D12CommandAllocator* [r8],
 ///            ID3D12PipelineState* [r9], REFIID, void** ppList)
-/// where Params is `{ u32 NodeMask@0; u32 _@4; D3D12_COMMAND_LIST_TYPE Type@8; u32 _@0xC }`.
 /// PC `CreateCommandList` (slot 12) takes (NodeMask, Type, alloc, initState, riid, ppList).
 unsafe extern "system" fn create_command_list_x(
     this: *mut DeviceWrapper, params: *const u32, alloc: *mut c_void,
@@ -263,7 +262,8 @@ unsafe extern "system" fn create_command_list_x(
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(*real_vtbl(real).add(12)) };
     let dma = !riid.is_null() && unsafe { *riid == crate::dma_list::IID_XBOX_DMA_COMMAND_LIST };
-    let pc_riid = if dma { &crate::dma_list::IID_GRAPHICS_COMMAND_LIST as *const Guid } else { riid };
+    let mapped = if riid.is_null() { None } else { crate::cmdlist_x::pc_list_iid(unsafe { &*riid }) };
+    let pc_riid = match mapped.as_ref() { Some(g) => g as *const Guid, None => riid };
     let hr = unsafe { f(real, node_mask, list_type, alloc, init_state, pc_riid, ppv) };
     if hr == S_OK && !ppv.is_null() {
         // Hand the title a shim object (Xbox vtable layout + inert inline-buffer fields)
@@ -272,7 +272,7 @@ unsafe extern "system" fn create_command_list_x(
             *ppv = if dma { crate::dma_list::wrap(*ppv) } else { crate::cmdlist_wrap::wrap(*ppv) };
         }
     }
-    record("d3d12_xs", "CreateCommandList", &format!("nodeMask={node_mask} type={list_type} dma={dma} -> hr={hr:#010x}"));
+    record("d3d12_xs", "CreateCommandList", &format!("nodeMask={node_mask} type={list_type} dma={dma} mapped={} -> hr={hr:#010x}", mapped.is_some()));
     hr
 }
 
