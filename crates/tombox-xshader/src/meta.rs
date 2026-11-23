@@ -511,3 +511,151 @@ mod fssm_wave_tests {
         assert_eq!(fssm_wave32(&[]), None);
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FssmRootKind {
+    Constants,
+    RootDescriptor,
+    TableDescriptor,
+    StaticSampler,
+    ResourceHeap,
+    SamplerHeap,
+    Other(u32),
+}
+
+impl FssmRootKind {
+    pub fn from_raw(k: u32) -> Self {
+        match k {
+            0 => Self::Constants,
+            1 => Self::RootDescriptor,
+            3 => Self::TableDescriptor,
+            4 => Self::StaticSampler,
+            5 => Self::ResourceHeap,
+            6 => Self::SamplerHeap,
+            x => Self::Other(x),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FssmRootEntry {
+    pub kind: FssmRootKind,
+    pub offset_dwords: u32,
+    pub count: u32,
+    pub register: u32,
+    pub root_param: u32,
+    pub user_sgpr: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FssmRoot {
+    pub user_sgprs: u32,
+    pub entries: Vec<FssmRootEntry>,
+}
+
+pub const FSSM_NO_ROOT_TABLE: u32 = 0xdead_beef;
+pub const FSSM_ROOT_ENTRY_BYTES: usize = 20;
+pub const FSSM_ROOT_MAX_ENTRIES: usize = 4096;
+
+pub fn fssm_root_table(fssm: &[u8]) -> Option<FssmRoot> {
+    if fssm.get(0..4) != Some(b"FSSM") {
+        return None;
+    }
+    let rd = |o: usize| fssm.get(o..o + 4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+    let user_sgprs = *fssm.get(0xd6)? as u32;
+    let n = rd(0xf8)? as usize;
+    if rd(0xe8)? == FSSM_NO_ROOT_TABLE || n == 0 {
+        return Some(FssmRoot { user_sgprs, entries: Vec::new() });
+    }
+    if n > FSSM_ROOT_MAX_ENTRIES {
+        return None;
+    }
+    let first = (rd(0xf0)? as usize).checked_sub(4 + FSSM_ROOT_ENTRY_BYTES * (n - 1))?;
+    if first < 0xfc || first + FSSM_ROOT_ENTRY_BYTES * n > fssm.len() {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(n);
+    for k in 0..n {
+        let e = first + FSSM_ROOT_ENTRY_BYTES * k;
+        let loc = rd(e + 16)?;
+        entries.push(FssmRootEntry {
+            kind: FssmRootKind::from_raw(rd(e)?),
+            offset_dwords: rd(e + 4)?,
+            count: rd(e + 8)?,
+            register: rd(e + 12)?,
+            root_param: loc >> 8,
+            user_sgpr: loc & 0xff,
+        });
+    }
+    Some(FssmRoot { user_sgprs, entries })
+}
+
+pub fn fssm_user_data_base(merged_or_ngg_stage: bool) -> u32 {
+    if merged_or_ngg_stage { 8 } else { 0 }
+}
+
+#[cfg(test)]
+mod fssm_root_tests {
+    use super::*;
+
+    fn blob(user_sgprs: u8, entries: &[[u32; 5]], at: usize, no_table: bool) -> Vec<u8> {
+        let mut b = vec![0u8; at + 20 * entries.len() + 16];
+        b[0..4].copy_from_slice(b"FSSM");
+        b[0xd6] = user_sgprs;
+        b[0xe8..0xec].copy_from_slice(&(if no_table { FSSM_NO_ROOT_TABLE } else { 0 }).to_le_bytes());
+        b[0xf8..0xfc].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        if !entries.is_empty() {
+            let last = at + 20 * (entries.len() - 1) + 4;
+            b[0xf0..0xf4].copy_from_slice(&(last as u32).to_le_bytes());
+        }
+        for (k, e) in entries.iter().enumerate() {
+            for (j, v) in e.iter().enumerate() {
+                let o = at + 20 * k + 4 * j;
+                b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn reads_every_entry_from_the_last_entry_pointer() {
+        let b = blob(17, &[[0, 0, 4, 0, (0 << 8) | 8], [1, 0, 2, 1, (1 << 8) | 12], [3, 6, 8, 2, (2 << 8) | 14], [5, 0, 1, 0, (3 << 8) | 16]], 0x200, false);
+        let r = fssm_root_table(&b).expect("table");
+        assert_eq!(r.user_sgprs, 17);
+        assert_eq!(r.entries.len(), 4);
+        assert_eq!(r.entries[0], FssmRootEntry { kind: FssmRootKind::Constants, offset_dwords: 0, count: 4, register: 0, root_param: 0, user_sgpr: 8 });
+        assert_eq!(r.entries[2], FssmRootEntry { kind: FssmRootKind::TableDescriptor, offset_dwords: 6, count: 8, register: 2, root_param: 2, user_sgpr: 14 });
+        assert_eq!(r.entries[3].kind, FssmRootKind::ResourceHeap);
+        assert_eq!(r.entries[1].kind, FssmRootKind::RootDescriptor);
+    }
+
+    #[test]
+    fn deadbeef_or_zero_count_means_no_table() {
+        let b = blob(17, &[[0, 0, 4, 0, 8]], 0x200, true);
+        assert_eq!(fssm_root_table(&b), Some(FssmRoot { user_sgprs: 17, entries: Vec::new() }));
+        let b = blob(9, &[], 0x200, false);
+        assert_eq!(fssm_root_table(&b), Some(FssmRoot { user_sgprs: 9, entries: Vec::new() }));
+    }
+
+    #[test]
+    fn refuses_tables_outside_the_blob_and_foreign_blobs() {
+        let mut b = blob(17, &[[0, 0, 4, 0, 8], [6, 0, 1, 0, 9]], 0x200, false);
+        assert!(fssm_root_table(&b[..0x200 + 30]).is_none());
+        b[0xf0..0xf4].copy_from_slice(&8u32.to_le_bytes());
+        assert!(fssm_root_table(&b).is_none());
+        b[0xf8..0xfc].copy_from_slice(&100_000u32.to_le_bytes());
+        assert!(fssm_root_table(&b).is_none());
+        b[0..4].copy_from_slice(b"XXXX");
+        assert!(fssm_root_table(&b).is_none());
+        assert!(fssm_root_table(&[]).is_none());
+    }
+
+    #[test]
+    fn kinds_and_user_data_base() {
+        assert_eq!(FssmRootKind::from_raw(4), FssmRootKind::StaticSampler);
+        assert_eq!(FssmRootKind::from_raw(6), FssmRootKind::SamplerHeap);
+        assert_eq!(FssmRootKind::from_raw(2), FssmRootKind::Other(2));
+        assert_eq!(fssm_user_data_base(true), 8);
+        assert_eq!(fssm_user_data_base(false), 0);
+    }
+}
